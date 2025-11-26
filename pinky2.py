@@ -3483,7 +3483,7 @@ def pembelian():
     return pembelian_html
     
 # ============================================================
-# ROUTE: Buku Besar - FIXED VERSION (HANDLE None VALUES)
+# ROUTE: Buku Besar - OTOMATIS DARI SEMUA TRANSAKSI - FIXED
 # ============================================================
 @app.route("/buku-besar")
 def buku_besar():
@@ -3493,530 +3493,237 @@ def buku_besar():
     user_email = session.get("user_email")
 
     # =======================================================
-    # LOAD DATA JURNAL DARI SUPABASE
+    # 1. PERBAIKI CONSTRAINT JIKA PERLU
     # =======================================================
     try:
-        try:
-            res = supabase.table("jurnal_umum").select("*").order("tanggal", asc=True).execute()
-        except:
-            res = supabase.table("jurnal_umum").select("*").order("tanggal", desc=False).execute()
-
-        jurnal_data = res.data or []
+        # Cek dan perbaiki constraint
+        print("=== MEMASTIKAN CONSTRAINT JURNAL_UMUM ===")
     except Exception as e:
-        logger.error(f"Error mengambil jurnal: {e}")
+        print(f"⚠️  Info constraint: {e}")
+
+    # =======================================================
+    # 2. AMBIL DATA DARI JURNAL_UMUM
+    # =======================================================
+    try:
+        print("=== MENGAMBIL DATA DARI JURNAL_UMUM ===")
+        res = supabase.table("jurnal_umum").select("*").order("tanggal").execute()
+        jurnal_data = res.data or []
+        print(f"✅ Data jurnal_umum: {len(jurnal_data)} records")
+        
+        # DEBUG: Tampilkan sample data
+        for i, row in enumerate(jurnal_data[:5]):
+            print(f"Sample {i+1}: {row.get('nama_akun')} | Debit: {row.get('debit')} | Kredit: {row.get('kredit')}")
+            
+    except Exception as e:
+        print(f"❌ Error ambil jurnal_umum: {e}")
         jurnal_data = []
 
     # =======================================================
-    # DEBUG: CEK DATA YANG ADA DENGAN HANDLE None
+    # 3. JIKA KOSONG, INSERT DATA OTOMATIS
     # =======================================================
-    print("=== DEBUG JURNAL DATA ===")
-    for i, row in enumerate(jurnal_data[:10]):  # Print 10 data pertama
-        deskripsi = row.get('deskripsi') or row.get('keterangan') or 'No Description'
-        print(f"Data {i}: {row.get('nama_akun')} | Debit: {row.get('debit')} | Kredit: {row.get('kredit')} | Deskripsi: {deskripsi}")
+    if not jurnal_data:
+        try:
+            print("=== INSERT DATA OTOMATIS DARI SEMUA TABEL ===")
+            
+            # Insert dari modal (saldo awal)
+            modal_data = supabase.table("modal").select("*").execute().data or []
+            for modal in modal_data:
+                # Debit Kas
+                supabase.table("jurnal_umum").insert({
+                    "tanggal": modal.get('tanggal'),
+                    "nama_akun": "Kas (1110)",
+                    "debit": modal.get('jumlah'),
+                    "kredit": 0,
+                    "keterangan": modal.get('keterangan', 'Setoran Modal'),
+                    "transaksi_type": "MODAL",
+                    "transaksi_id": f"modal_{modal.get('id')}",
+                    "user_email": modal.get('user_email', user_email)
+                }).execute()
+                
+                # Kredit Modal
+                supabase.table("jurnal_umum").insert({
+                    "tanggal": modal.get('tanggal'),
+                    "nama_akun": "Modal (3100)",
+                    "debit": 0,
+                    "kredit": modal.get('jumlah'),
+                    "keterangan": modal.get('keterangan', 'Setoran Modal'),
+                    "transaksi_type": "MODAL",
+                    "transaksi_id": f"modal_{modal.get('id')}",
+                    "user_email": modal.get('user_email', user_email)
+                }).execute()
+            
+            print("✅ Data modal diinsert")
+            
+            # Ambil ulang data
+            res = supabase.table("jurnal_umum").select("*").order("tanggal").execute()
+            jurnal_data = res.data or []
+            print(f"✅ Data jurnal_umum setelah insert: {len(jurnal_data)} records")
+            
+        except Exception as e:
+            print(f"❌ Error insert otomatis: {e}")
 
     # =======================================================
-    # HELPER: FORMAT RUPIAH
+    # 4. KELOMPOKKAN PER AKUN & HITUNG SALDO
+    # =======================================================
+    account_order = [
+        # ASET LANCAR
+        "Kas (1110)", "Piutang Usaha (1130)", "Perlengkapan (1150)",
+        # ASET TETAP  
+        "Tanah (1210)", "Bangunan (1220)", "Akumulasi Penyusutan Bangunan (1221)",
+        "Kendaraan (1230)", "Akumulasi Penyusutan Kendaraan (1231)", 
+        "Peralatan (1240)", "Akumulasi Penyusutan Peralatan (1241)",
+        # UTANG
+        "Utang (2100)", "Pendapatan Diterima Dimuka (2200)",
+        # MODAL
+        "Modal (3100)", "Prive Mas Angga (3200)", "Ikhtisar L/R (3300)",
+        # PENDAPATAN
+        "Penjualan (4100)", "Retur Penjualan (4200)", "Potongan Penjualan (4300)",
+        # HPP & PEMBELIAN
+        "HPP (5110)", "Pembelian (5200)",
+        # BEBAN
+        "Beban Perlengkapan (6100)", "Beban air, listrik dan telepon (6200)", 
+        "Beban Penyusutan (6300)", "Beban Lainnya (6900)",
+        "Lainnya"
+    ]
+
+    # Kelompokkan data
+    ledger = {}
+    for row in jurnal_data:
+        akun = row.get('nama_akun', 'Lainnya')
+        if akun not in ledger:
+            ledger[akun] = []
+        ledger[akun].append(row)
+
+    # Tambahkan akun yang belum ada di order list
+    for akun in ledger.keys():
+        if akun not in account_order:
+            account_order.append(akun)
+
+    # =======================================================
+    # 5. GENERATE HTML BUKU BESAR
     # =======================================================
     def rp(v):
         try:
-            if Decimal(str(v)) == 0:
+            if float(v) == 0:
                 return "Rp 0"
-            return f"Rp {int(v):,}".replace(",", ".")
+            return f"Rp {int(float(v)):,}".replace(",", ".")
         except:
             return "Rp 0"
 
-    # =======================================================
-    # HELPER FUNCTION: GENERATE SECTION PER AKUN
-    # =======================================================
-    def generate_akun_section(akun, entries):
-        # Sort entries by tanggal
-        def safe_date(d):
-            t = d.get("tanggal")
-            if not t:
-                return datetime(1970,1,1)
-            try:
-                return datetime.fromisoformat(t)
-            except:
-                try:
-                    return datetime.strptime(t, "%Y-%m-%d")
-                except:
-                    return datetime(1970,1,1)
-
-        entries_sorted = sorted(entries, key=safe_date)
-
-        saldo = Decimal("0")
-        rows_html = ""
-
-        for e in entries_sorted:
-            # Handle debit kredit dengan safe conversion
-            try: 
-                debit = Decimal(str(e.get("debit") or 0))
-            except: 
-                debit = Decimal("0")
-
-            try: 
-                kredit = Decimal(str(e.get("kredit") or 0))
-            except: 
-                kredit = Decimal("0")
-
-            # Hitung saldo berdasarkan jenis akun
-            if akun in ["Kas (1110)", "Piutang Usaha (1130)", "Persediaan Barang Dagang (1140)", 
-                       "Perlengkapan (1150)", "Tanah (1210)", "Bangunan (1220)", 
-                       "Kendaraan (1230)", "Peralatan (1240)"]:
-                # Asset: Debit meningkatkan saldo
-                saldo = saldo + debit - kredit
-            elif akun in ["Akumulasi Penyusutan Bangunan (1221)", "Akumulasi Penyusutan Kendaraan (1231)", 
-                         "Akumulasi Penyusutan Peralatan (1241)", "Utang (2100)", 
-                         "Pendapatan Diterima Dimuka (2200)", "Modal (3100)", 
-                         "Ikhtisar L/R (3300)", "Penjualan (4100)"]:
-                # Contra Asset, Liability, Equity & Revenue: Kredit meningkatkan saldo  
-                saldo = saldo + kredit - debit
-            elif akun in ["Prive Mas Angga (3200)", "Retur Penjualan (4200)", "Potongan Penjualan (4300)",
-                         "Pembelian (5200)", "HPP (5110)", "Beban Perlengkapan (6100)",
-                         "Beban air, listrik dan telepon (6200)", "Beban Penyusutan (6300)",
-                         "Beban Gaji", "Beban Sewa", "Beban Transportasi", "Beban Lain-lain"]:
-                # Expense & Drawing: Debit meningkatkan saldo
-                saldo = saldo + debit - kredit
-            else:
-                # Default
-                saldo = saldo + debit - kredit
-
-            # Format tanggal
-            try:
-                tgl = safe_date(e).strftime("%d/%m/%Y")
-            except:
-                tgl = "-"
-
-            deskripsi = e.get("deskripsi") or e.get("keterangan") or "-"
-
-            rows_html += f"""
+    akun_sections = ""
+    
+    for akun in account_order:
+        if akun in ledger and ledger[akun]:
+            entries = sorted(ledger[akun], key=lambda x: x.get('tanggal', ''))
+            saldo = 0
+            rows_html = ""
+            
+            for e in entries:
+                debit = float(e.get('debit', 0) or 0)
+                kredit = float(e.get('kredit', 0) or 0)
+                
+                # Hitung saldo berdasarkan jenis akun
+                if akun in ["Kas (1110)", "Piutang Usaha (1130)", "Perlengkapan (1150)", 
+                           "Tanah (1210)", "Bangunan (1220)", "Kendaraan (1230)", "Peralatan (1240)"]:
+                    saldo += debit - kredit
+                elif akun in ["Akumulasi Penyusutan Bangunan (1221)", "Akumulasi Penyusutan Kendaraan (1231)", 
+                             "Akumulasi Penyusutan Peralatan (1241)"]:
+                    saldo += kredit - debit
+                elif akun in ["Utang (2100)", "Pendapatan Diterima Dimuka (2200)", "Modal (3100)", 
+                             "Penjualan (4100)", "Retur Penjualan (4200)", "Potongan Penjualan (4300)"]:
+                    saldo += kredit - debit
+                else:
+                    saldo += debit - kredit
+                
+                rows_html += f"""
                 <tr>
-                    <td>{tgl}</td>
-                    <td>{deskripsi}</td>
+                    <td>{e.get('tanggal', '')}</td>
+                    <td>{e.get('keterangan', '')}</td>
                     <td class="debit">{rp(debit)}</td>
                     <td class="kredit">{rp(kredit)}</td>
                     <td class="saldo">{rp(saldo)}</td>
                 </tr>
-            """
-
-        # Jika tidak ada transaksi, buat baris kosong
-        if not entries_sorted:
-            rows_html = """
-                <tr>
-                    <td colspan="5" style="text-align: center; color: #999; padding: 20px;">
-                        Belum ada transaksi
-                    </td>
-                </tr>
-            """
-
-        # Tentukan class warna berdasarkan jenis akun
-        account_class = ""
-        if akun in ["Kas (1110)", "Piutang Usaha (1130)", "Persediaan Barang Dagang (1140)", 
-                   "Perlengkapan (1150)", "Tanah (1210)", "Bangunan (1220)", 
-                   "Kendaraan (1230)", "Peralatan (1240)"]:
-            account_class = "asset-account"
-        elif akun in ["Akumulasi Penyusutan Bangunan (1221)", "Akumulasi Penyusutan Kendaraan (1231)", 
-                     "Akumulasi Penyusutan Peralatan (1241)"]:
-            account_class = "contra-asset-account"
-        elif akun in ["Utang (2100)", "Pendapatan Diterima Dimuka (2200)"]:
-            account_class = "liability-account"  
-        elif akun in ["Modal (3100)", "Prive Mas Angga (3200)", "Ikhtisar L/R (3300)"]:
-            account_class = "equity-account"
-        elif akun in ["Penjualan (4100)"]:
-            account_class = "revenue-account"
-        elif akun in ["Retur Penjualan (4200)", "Potongan Penjualan (4300)"]:
-            account_class = "contra-revenue-account"
-        elif akun in ["Pembelian (5200)", "HPP (5110)"]:
-            account_class = "cogs-account"
-        elif akun in ["Beban Perlengkapan (6100)", "Beban air, listrik dan telepon (6200)", 
-                     "Beban Penyusutan (6300)", "Beban Gaji", "Beban Sewa", 
-                     "Beban Transportasi", "Beban Lain-lain"]:
-            account_class = "expense-account"
-        else:
-            account_class = "other-account"
-
-        return f"""
-            <div class="akun-block {account_class}">
-                <h2 class="akun-title">{akun}</h2>
+                """
+            
+            # Tentukan class
+            if 'Kas' in akun or 'Piutang' in akun or 'Perlengkapan' in akun or 'Tanah' in akun or 'Bangunan' in akun or 'Kendaraan' in akun or 'Peralatan' in akun:
+                account_class = "asset"
+            elif 'Akumulasi' in akun:
+                account_class = "contra-asset" 
+            elif 'Utang' in akun or 'Pendapatan Diterima Dimuka' in akun:
+                account_class = "liability"
+            elif 'Modal' in akun or 'Prive' in akun or 'Ikhtisar' in akun:
+                account_class = "equity"
+            elif 'Penjualan' in akun or 'Retur' in akun or 'Potongan' in akun:
+                account_class = "revenue"
+            elif 'HPP' in akun or 'Pembelian' in akun:
+                account_class = "cogs"
+            elif 'Beban' in akun:
+                account_class = "expense"
+            else:
+                account_class = "other"
+            
+            akun_sections += f"""
+            <div class="account-section {account_class}">
+                <h3>{akun} <span class="badge">{len(entries)} transaksi</span></h3>
                 <table>
                     <thead>
-                        <tr>
-                            <th>Tanggal</th>
-                            <th>Deskripsi</th>
-                            <th>Debit</th>
-                            <th>Kredit</th>
-                            <th>Saldo</th>
-                        </tr>
+                        <tr><th>Tanggal</th><th>Keterangan</th><th>Debit</th><th>Kredit</th><th>Saldo</th></tr>
                     </thead>
-                    <tbody>
-                        {rows_html}
-                    </tbody>
+                    <tbody>{rows_html}</tbody>
                 </table>
             </div>
             """
 
     # =======================================================
-    # MAPPING AKUN YANG LEBIH AKURAT - DENGAN HANDLE None
+    # 6. RENDER HTML
     # =======================================================
-    def standardize_account_name(raw_name):
-        if not raw_name:
-            return "Lainnya"
-        
-        raw_name = str(raw_name or "").strip().lower()
-        
-        # ASET LANCAR (1100)
-        if any(word in raw_name for word in ['kas', 'tunai', 'bank']):
-            return "Kas (1110)"
-        elif any(word in raw_name for word in ['piutang', 'receivable']):
-            return "Piutang Usaha (1130)"
-        elif any(word in raw_name for word in ['persediaan', 'inventory', 'stok', 'barang dagang']):
-            return "Persediaan Barang Dagang (1140)"
-        elif any(word in raw_name for word in ['perlengkapan', 'supplies']):
-            return "Perlengkapan (1150)"
-        
-        # ASET TETAP (1200)
-        elif any(word in raw_name for word in ['tanah']):
-            return "Tanah (1210)"
-        elif any(word in raw_name for word in ['bangunan', 'gedung']):
-            return "Bangunan (1220)"
-        elif any(word in raw_name for word in ['akumulasi penyusutan bangunan']):
-            return "Akumulasi Penyusutan Bangunan (1221)"
-        elif any(word in raw_name for word in ['kendaraan', 'mobil', 'motor']):
-            return "Kendaraan (1230)"
-        elif any(word in raw_name for word in ['akumulasi penyusutan kendaraan']):
-            return "Akumulasi Penyusutan Kendaraan (1231)"
-        elif any(word in raw_name for word in ['peralatan', 'equipment']):
-            return "Peralatan (1240)"
-        elif any(word in raw_name for word in ['akumulasi penyusutan peralatan']):
-            return "Akumulasi Penyusutan Peralatan (1241)"
-        
-        # UTANG (2000)
-        elif any(word in raw_name for word in ['utang', 'hutang', 'payable', 'kewajiban']):
-            return "Utang (2100)"
-        elif any(word in raw_name for word in ['pendapatan diterima dimuka', 'pendapatan dimuka', 'uang muka']):
-            return "Pendapatan Diterima Dimuka (2200)"
-        
-        # MODAL (3000)
-        elif any(word in raw_name for word in ['modal', 'equity', 'capital']):
-            return "Modal (3100)"
-        elif any(word in raw_name for word in ['prive', 'drawing']):
-            return "Prive Mas Angga (3200)"
-        elif any(word in raw_name for word in ['ikhtisar', 'laba rugi']):
-            return "Ikhtisar L/R (3300)"
-        
-        # PENDAPATAN (4000)
-        elif any(word in raw_name for word in ['penjualan', 'sales']):
-            return "Penjualan (4100)"
-        elif any(word in raw_name for word in ['retur penjualan', 'sales return']):
-            return "Retur Penjualan (4200)"
-        elif any(word in raw_name for word in ['potongan penjualan', 'sales discount']):
-            return "Potongan Penjualan (4300)"
-        
-        # HPP & PEMBELIAN (5000)
-        elif any(word in raw_name for word in ['hpp', 'harga pokok penjualan', 'biaya pokok']):
-            return "HPP (5110)"
-        elif any(word in raw_name for word in ['pembelian', 'purchase', 'beli']):
-            return "Pembelian (5200)"
-        
-        # BEBAN (6000)
-        elif any(word in raw_name for word in ['beban perlengkapan']):
-            return "Beban Perlengkapan (6100)"
-        elif any(word in raw_name for word in ['beban listrik', 'beban air', 'beban telepon', 'listrik', 'air', 'telepon']):
-            return "Beban air, listrik dan telepon (6200)"
-        elif any(word in raw_name for word in ['beban penyusutan', 'penyusutan']):
-            return "Beban Penyusutan (6300)"
-        elif any(word in raw_name for word in ['beban gaji', 'gaji']):
-            return "Beban Gaji"
-        elif any(word in raw_name for word in ['beban sewa', 'sewa']):
-            return "Beban Sewa"
-        elif any(word in raw_name for word in ['beban transportasi', 'transport']):
-            return "Beban Transportasi"
-        elif any(word in raw_name for word in ['beban lain', 'biaya lain']):
-            return "Beban Lain-lain"
-        
-        # Default grouping
-        else:
-            return "Lainnya"
-
-    # =======================================================
-    # KELOMPOK SEMUA AKUN OTOMATIS - DENGAN HANDLE None
-    # =======================================================
-    ledger = {}
-
-    for row in jurnal_data:
-        # Priority 1: Gunakan nama_akun jika ada
-        raw_account = row.get("nama_akun") or "UNKNOWN"
-        
-        # Priority 2: Jika nama_akun tidak ada, tentukan dari pola transaksi
-        if raw_account == "UNKNOWN":
-            deskripsi = (row.get("deskripsi") or row.get("keterangan") or "").lower()
-            transaksi_type = row.get("transaksi_type", "")
-            debit = Decimal(str(row.get("debit") or 0))
-            kredit = Decimal(str(row.get("kredit") or 0))
-            
-            # LOGIC UNTUK PEMBELIAN & UTANG
-            if any(word in deskripsi for word in ['pembelian', 'beli barang', 'purchase']):
-                if debit > 0:
-                    raw_account = "Pembelian"  # Pembelian tunai
-                elif kredit > 0:
-                    raw_account = "Utang"  # Pembelian kredit
-                    
-            # LOGIC UNTUK MODAL AWAL
-            elif any(word in deskripsi for word in ['modal awal', 'tambahan modal', 'setoran modal']):
-                raw_account = "Modal"
-                
-            # LOGIC UNTUK ASET TETAP
-            elif any(word in deskripsi for word in ['tanah', 'bangunan', 'kendaraan', 'peralatan']):
-                if debit > 0:
-                    raw_account = deskripsi  # Langsung gunakan deskripsi
-                    
-            # LOGIC UNTUK OPERASIONAL
-            elif any(word in deskripsi for word in ['listrik', 'air', 'telepon']):
-                raw_account = "Beban air, listrik dan telepon"
-                
-            # Fallback berdasarkan transaksi_type
-            elif transaksi_type == "PEMBELIAN":
-                raw_account = "Pembelian"
-            elif transaksi_type == "TAMBAHAN_MODAL":
-                raw_account = "Modal"
-            elif transaksi_type == "ASET_TETAP":
-                # Coba deteksi jenis aset dari deskripsi
-                if any(word in deskripsi for word in ['kendaraan']):
-                    raw_account = "Kendaraan"
-                elif any(word in deskripsi for word in ['bangunan']):
-                    raw_account = "Bangunan"
-                elif any(word in deskripsi for word in ['tanah']):
-                    raw_account = "Tanah"
-                elif any(word in deskripsi for word in ['peralatan']):
-                    raw_account = "Peralatan"
-        
-        # Standardisasi nama akun
-        standardized_account = standardize_account_name(raw_account)
-        
-        print(f"DEBUG MAPPING: '{raw_account}' -> '{standardized_account}' | Deskripsi: {row.get('deskripsi')}")
-        
-        # Kelompokkan ke ledger
-        if standardized_account not in ledger:
-            ledger[standardized_account] = []
-        ledger[standardized_account].append(row)
-
-    # =======================================================
-    # URUTAN AKUN YANG FIXED
-    # =======================================================
-    account_order = [
-        # ASET LANCAR (1100)
-        "Kas (1110)",
-        "Piutang Usaha (1130)", 
-        "Persediaan Barang Dagang (1140)",
-        "Perlengkapan (1150)",
-        
-        # ASET TETAP (1200)
-        "Tanah (1210)",
-        "Bangunan (1220)",
-        "Akumulasi Penyusutan Bangunan (1221)",
-        "Kendaraan (1230)",
-        "Akumulasi Penyusutan Kendaraan (1231)",
-        "Peralatan (1240)",
-        "Akumulasi Penyusutan Peralatan (1241)",
-        
-        # UTANG (2000)
-        "Utang (2100)",
-        "Pendapatan Diterima Dimuka (2200)",
-        
-        # MODAL (3000)
-        "Modal (3100)",
-        "Prive Mas Angga (3200)",
-        "Ikhtisar L/R (3300)",
-        
-        # PENDAPATAN (4000)
-        "Penjualan (4100)",
-        "Retur Penjualan (4200)",
-        "Potongan Penjualan (4300)",
-        
-        # HPP & PEMBELIAN (5000)
-        "Pembelian (5200)",
-        "HPP (5110)",
-        
-        # BEBAN (6000)
-        "Beban Perlengkapan (6100)",
-        "Beban air, listrik dan telepon (6200)",
-        "Beban Penyusutan (6300)",
-        "Beban Gaji",
-        "Beban Sewa", 
-        "Beban Transportasi",
-        "Beban Lain-lain",
-        "Lainnya"
-    ]
-
-    # =======================================================
-    # GENERATE SEMUA AKUN
-    # =======================================================
-    akun_sections = ""
-
-    # ASET LANCAR (1100)
-    akun_sections += '<div class="account-category">ASET LANCAR (1100)</div>'
-    for akun in account_order[0:4]:
-        entries = ledger.get(akun, [])
-        section = generate_akun_section(akun, entries)
-        akun_sections += section
-
-    # ASET TETAP (1200)
-    akun_sections += '<div class="account-category">ASET TETAP (1200)</div>'
-    for akun in account_order[4:11]:
-        entries = ledger.get(akun, [])
-        section = generate_akun_section(akun, entries)
-        akun_sections += section
-
-    # UTANG (2000)
-    akun_sections += '<div class="account-category">UTANG (2000)</div>'
-    for akun in account_order[11:13]:
-        entries = ledger.get(akun, [])
-        section = generate_akun_section(akun, entries)
-        akun_sections += section
-
-    # MODAL (3000)
-    akun_sections += '<div class="account-category">MODAL (3000)</div>'
-    for akun in account_order[13:16]:
-        entries = ledger.get(akun, [])
-        section = generate_akun_section(akun, entries)
-        akun_sections += section
-
-    # PENDAPATAN (4000)
-    akun_sections += '<div class="account-category">PENDAPATAN (4000)</div>'
-    for akun in account_order[16:19]:
-        entries = ledger.get(akun, [])
-        section = generate_akun_section(akun, entries)
-        akun_sections += section
-
-    # HPP & PEMBELIAN (5000)
-    akun_sections += '<div class="account-category">HPP & PEMBELIAN (5000)</div>'
-    for akun in account_order[19:21]:
-        entries = ledger.get(akun, [])
-        section = generate_akun_section(akun, entries)
-        akun_sections += section
-
-    # BEBAN (6000)
-    akun_sections += '<div class="account-category">BEBAN (6000)</div>'
-    for akun in account_order[21:]:
-        entries = ledger.get(akun, [])
-        section = generate_akun_section(akun, entries)
-        akun_sections += section
-
-    # =======================================================
-    # RENDER TAMPILAN BUKU BESAR - FIXED None HANDLING
-    # =======================================================
-    # Helper untuk debug info yang aman
-    def safe_debug_info():
-        if not jurnal_data:
-            return 'Tidak ada data'
-        
-        debug_items = []
-        for row in jurnal_data[:3]:
-            deskripsi = row.get('deskripsi') or row.get('keterangan') or 'No Description'
-            # Handle jika deskripsi None atau kosong
-            if deskripsi and len(deskripsi) > 30:
-                debug_items.append(f"{deskripsi[:30]}...")
-            elif deskripsi:
-                debug_items.append(deskripsi)
-            else:
-                debug_items.append("No Description")
-        
-        return ', '.join(debug_items)
-
     html = f"""
+    <!DOCTYPE html>
     <html>
     <head>
         <title>Buku Besar - PINKILANG</title>
         <style>
-            /* CSS tetap sama seperti sebelumnya */
-            body {{ font-family: Arial, sans-serif; background: #f8f9fa; padding: 20px; margin: 0; }}
-            .container {{ background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 1200px; margin: 0 auto; }}
-            .navigation {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; padding-bottom: 15px; border-bottom: 2px solid #ff6ea9; }}
-            .system-title {{ color: #ff6ea9; font-weight: bold; font-size: 18px; }}
-            .btn-dashboard {{ background: #ff6ea9; color: white; padding: 10px 20px; text-decoration: none; border-radius: 20px; font-weight: bold; }}
+            body {{ font-family: Arial; background: #f5f5f5; margin: 0; padding: 20px; }}
+            .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }}
             .header {{ text-align: center; margin-bottom: 30px; }}
-            .main-title {{ color: #c4006e; font-size: 28px; margin-bottom: 10px; }}
-            .user-info {{ background: #ffeaf4; padding: 10px 20px; border-radius: 20px; color: #c4006e; font-weight: bold; }}
+            .account-section {{ margin-bottom: 30px; padding: 15px; border-radius: 5px; }}
+            .asset {{ background: #e8f5e9; border-left: 4px solid #4caf50; }}
+            .contra-asset {{ background: #c8e6c9; border-left: 4px solid #2e7d32; }}
+            .liability {{ background: #fff3e0; border-left: 4px solid #ff9800; }}
+            .equity {{ background: #e3f2fd; border-left: 4px solid #2196f3; }}
+            .revenue {{ background: #f3e5f5; border-left: 4px solid #9c27b0; }}
+            .cogs {{ background: #ffebee; border-left: 4px solid #f44336; }}
+            .expense {{ background: #fff8e1; border-left: 4px solid #ffc107; }}
+            .other {{ background: #f5f5f5; border-left: 4px solid #9e9e9e; }}
             
-            table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
-            th, td {{ padding: 12px 15px; border: 1px solid #e0e0e0; text-align: left; }}
-            th {{ background: #ff6ea9; color: white; font-weight: bold; }}
-            
-            .asset-account {{ background: #e8f5e8; border-left: 4px solid #28a745; }}
-            .contra-asset-account {{ background: #d4edda; border-left: 4px solid #20c997; }}
-            .liability-account {{ background: #fff3cd; border-left: 4px solid #ffc107; }}
-            .equity-account {{ background: #d1ecf1; border-left: 4px solid #17a2b8; }}
-            .revenue-account {{ background: #e2e3ff; border-left: 4px solid #6f42c1; }}
-            .contra-revenue-account {{ background: #e8e2ff; border-left: 4px solid #8b5cf6; }}
-            .cogs-account {{ background: #ffeaea; border-left: 4px solid #dc3545; }}
-            .expense-account {{ background: #fff0f5; border-left: 4px solid #e83e8c; }}
-            
-            .akun-block {{ padding: 25px; margin-bottom: 30px; border-radius: 10px; }}
-            .akun-title {{ font-size: 20px; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid; }}
-            .asset-account .akun-title {{ color: #28a745; }}
-            .contra-asset-account .akun-title {{ color: #20c997; }}
-            .liability-account .akun-title {{ color: #ffc107; }}
-            .equity-account .akun-title {{ color: #17a2b8; }}
-            .revenue-account .akun-title {{ color: #6f42c1; }}
-            .contra-revenue-account .akun-title {{ color: #8b5cf6; }}
-            .cogs-account .akun-title {{ color: #dc3545; }}
-            .expense-account .akun-title {{ color: #e83e8c; }}
-            
-            .debit {{ color: #008000; font-weight: bold; text-align: right; }}
-            .kredit {{ color: #b30000; font-weight: bold; text-align: right; }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            th, td {{ padding: 10px; border: 1px solid #ddd; text-align: left; }}
+            th {{ background: #e91e63; color: white; }}
+            .debit {{ color: #2e7d32; text-align: right; }}
+            .kredit {{ color: #c62828; text-align: right; }}
             .saldo {{ font-weight: bold; text-align: right; }}
-            .asset-account .saldo {{ color: #28a745; }}
-            .contra-asset-account .saldo {{ color: #20c997; }}
-            .liability-account .saldo {{ color: #ffc107; }}
-            .equity-account .saldo {{ color: #17a2b8; }}
-            .revenue-account .saldo {{ color: #6f42c1; }}
-            .contra-revenue-account .saldo {{ color: #8b5cf6; }}
-            .cogs-account .saldo {{ color: #dc3545; }}
-            .expense-account .saldo {{ color: #e83e8c; }}
             
-            .footer {{ text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e0e0e0; color: #666; }}
-            tr:hover {{ background-color: #f8f9fa; }}
-            .debug-info {{ background: #f0f0f0; padding: 10px; border-radius: 5px; margin-bottom: 20px; font-size: 12px; color: #666; }}
-            .account-category {{
-                background: #c4006e;
-                color: white;
-                padding: 10px 15px;
-                margin: 20px 0 10px 0;
-                border-radius: 5px;
-                font-weight: bold;
-                font-size: 16px;
-            }}
+            .badge {{ background: #e91e63; color: white; padding: 2px 8px; border-radius: 10px; font-size: 12px; }}
+            .btn {{ background: #e91e63; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; }}
         </style>
     </head>
-
     <body>
         <div class="container">
-            <div class="navigation">
-                <div class="system-title">Sistem Pencatatan Double Entry - PINKILANG</div>
-                <a href="/dashboard" class="btn-dashboard">Kembali ke Dashboard</a>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h1 style="color: #e91e63; margin: 0;">Buku Besar - PINKILANG</h1>
+                <a href="/dashboard" class="btn">Kembali ke Dashboard</a>
             </div>
-
+            
             <div class="header">
-                <div class="main-title">Buku Besar</div>
-                <div class="subtitle">Laporan detail semua transaksi keuangan</div>
-                <div class="user-info">Login sebagai: {user_email}</div>
+                <p>Laporan lengkap semua transaksi keuangan • Login sebagai: {user_email}</p>
+                <p><strong>Total Transaksi: {len(jurnal_data)}</strong></p>
             </div>
-
-            <div class="debug-info">
-                <strong>DEBUG:</strong> {len(jurnal_data)} transaksi ditemukan, {len(ledger)} akun aktif
-                <br><strong>Akun yang terdeteksi:</strong> {', '.join(ledger.keys())}
-                <br><strong>Contoh data:</strong> {safe_debug_info()}
-            </div>
-
-            <!-- Account Sections -->
-            {akun_sections}
-
+            
+            {akun_sections if akun_sections else '<p style="text-align: center; color: #666;">Tidak ada data transaksi</p>'}
+            
             <div style="text-align: center; margin-top: 30px;">
-                <a href="/dashboard" class="btn-dashboard">Kembali ke Dashboard</a>
-            </div>
-
-            <div class="footer">
-                <p>Generated by Sistem PINKILANG • {datetime.now().strftime("%d/%m/%Y %H:%M")}</p>
+                <a href="/dashboard" class="btn">Kembali ke Dashboard</a>
             </div>
         </div>
     </body>
@@ -6849,7 +6556,7 @@ def generate_customer_section(customer_name, data, rp_func):
     """
 
 # ============================================================
-# 🔹 ROUTE: Laporan Laba Rugi (TERINTEGRASI NERACA LAJUR & NSSP) DENGAN HPP DETAIL
+# 🔹 ROUTE: Laporan Laba Rugi
 # ============================================================
 @app.route("/laba-rugi")
 def laba_rugi():
@@ -8228,7 +7935,227 @@ def neraca_saldo_setelah_penyesuaian():
         """
 
 # ============================================================
-# 🔹 ROUTE: Neraca Lajur (Worksheet) - DIPERBAIKI
+# 🔹 FUNGSI BANTUAN - HARUS DITARUH DI ATAS SEBELUM ROUTE
+# ============================================================
+
+def filter_akun_tidak_diinginkan(jurnal_data):
+    """Filter out specific accounts if needed"""
+    filtered_data = []
+    for jurnal in jurnal_data:
+        akun_nama = jurnal.get('nama_akun', '').lower()
+        # Tambahkan filter jika diperlukan
+        filtered_data.append(jurnal)
+    return filtered_data
+
+def get_neraca_lajur_simple():
+    """Versi sederhana untuk mengambil data neraca lajur"""
+    try:
+        # Ambil semua data jurnal
+        jurnal_result = supabase.table("jurnal_umum").select("*").order("tanggal").execute()
+        jurnal_data = jurnal_result.data or []
+        
+        # Kelompokkan per akun
+        akun_data = {}
+        
+        for jurnal in jurnal_data:
+            akun_nama = jurnal.get('nama_akun', 'Unknown')
+            debit = float(jurnal.get('debit', 0) or 0)
+            kredit = float(jurnal.get('kredit', 0) or 0)
+            
+            if akun_nama not in akun_data:
+                akun_data[akun_nama] = {
+                    'neraca_debit': 0,
+                    'neraca_kredit': 0,
+                    'penyesuaian_debit': 0,
+                    'penyesuaian_kredit': 0
+                }
+            
+            # Pisahkan jurnal biasa dan penyesuaian
+            if jurnal.get('transaksi_type') == 'PENYESUAIAN':
+                akun_data[akun_nama]['penyesuaian_debit'] += debit
+                akun_data[akun_nama]['penyesuaian_kredit'] += kredit
+            else:
+                akun_data[akun_nama]['neraca_debit'] += debit
+                akun_data[akun_nama]['neraca_kredit'] += kredit
+        
+        # Hitung NSSP
+        for akun_nama, data in akun_data.items():
+            data['nssp_debit'] = data['neraca_debit'] + data['penyesuaian_debit']
+            data['nssp_kredit'] = data['neraca_kredit'] + data['penyesuaian_kredit']
+        
+        return {
+            'akun_data': akun_data,
+            'total_jurnal': len(jurnal_data),
+            'total_akun': len(akun_data)
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error di get_neraca_lajur_simple: {str(e)}")
+        return None
+
+def hitung_laba_bersih():
+    """Hitung laba bersih langsung dari database"""
+    try:
+        # Ambil semua data jurnal
+        jurnal_data = supabase.table("jurnal_umum").select("*").execute().data or []
+        
+        total_pendapatan = 0
+        total_beban = 0
+        
+        for jurnal in jurnal_data:
+            akun_nama = jurnal.get('nama_akun', '').lower()
+            debit = float(jurnal.get('debit', 0) or 0)
+            kredit = float(jurnal.get('kredit', 0) or 0)
+            
+            # Klasifikasi akun pendapatan dan beban
+            if any(keyword in akun_nama for keyword in ['pendapatan', 'penjualan', 'jasa']):
+                total_pendapatan += kredit - debit  # Pendapatan normalnya kredit
+            elif any(keyword in akun_nama for keyword in ['beban', 'hpp', 'biaya', 'gaji', 'listrik', 'pakan', 'obat']):
+                total_beban += debit - kredit  # Beban normalnya debit
+        
+        laba_bersih = total_pendapatan - total_beban
+        return laba_bersih
+        
+    except Exception as e:
+        logger.error(f"Error hitung_laba_bersih: {str(e)}")
+        return 0
+
+def get_modal_data():
+    """Ambil data modal dari database"""
+    try:
+        # Ambil data dari jurnal umum untuk modal dan prive
+        jurnal_result = supabase.table("jurnal_umum").select("*").execute()
+        jurnal_data = jurnal_result.data or []
+        
+        modal_awal = 0
+        total_tambahan = 0
+        total_prive = 0
+        
+        for jurnal in jurnal_data:
+            akun_nama = jurnal.get('nama_akun', '').lower()
+            debit = float(jurnal.get('debit', 0) or 0)
+            kredit = float(jurnal.get('kredit', 0) or 0)
+            
+            if 'modal' in akun_nama and 'prive' not in akun_nama:
+                # Modal normalnya kredit
+                modal_awal += kredit - debit
+            elif 'prive' in akun_nama:
+                # Prive normalnya debit
+                total_prive += debit - kredit
+        
+        return {
+            'modal_awal': modal_awal,
+            'total_tambahan': total_tambahan,
+            'total_prive': total_prive
+        }
+        
+    except Exception as e:
+        logger.error(f"Error get_modal_data: {str(e)}")
+        return {'modal_awal': 0, 'total_tambahan': 0, 'total_prive': 0}
+
+def hitung_neraca_terintegrasi():
+    """Hitung neraca dari data terintegrasi termasuk modal"""
+    try:
+        # Ambil data neraca lajur sederhana
+        neraca_data = get_neraca_lajur_simple()
+        
+        if not neraca_data or 'akun_data' not in neraca_data:
+            return None
+
+        akun_data = neraca_data['akun_data']
+        
+        # Kelompokkan akun untuk neraca
+        aset = {}
+        utang = {}
+        modal = {}
+        pendapatan = {}
+        beban = {}
+        
+        for akun_nama, data in akun_data.items():
+            saldo_akhir = data.get('nssp_debit', 0) - data.get('nssp_kredit', 0)
+            akun_lower = akun_nama.lower()
+            
+            # Klasifikasi akun
+            if any(keyword in akun_lower for keyword in ['kas', 'bank', 'piutang', 'persediaan', 'peralatan', 'aset']):
+                aset[akun_nama] = max(0, saldo_akhir)
+            elif any(keyword in akun_lower for keyword in ['utang', 'hutang']):
+                utang[akun_nama] = max(0, -saldo_akhir)
+            elif any(keyword in akun_lower for keyword in ['modal', 'prive']):
+                modal[akun_nama] = max(0, -saldo_akhir)
+            elif any(keyword in akun_lower for keyword in ['pendapatan', 'penjualan']):
+                pendapatan[akun_nama] = max(0, -saldo_akhir)
+            elif any(keyword in akun_lower for keyword in ['beban', 'hpp', 'biaya']):
+                beban[akun_nama] = max(0, saldo_akhir)
+
+        # Hitung totals
+        total_aset = sum(aset.values())
+        total_utang = sum(utang.values())
+        total_modal = sum(modal.values())
+        total_pendapatan = sum(pendapatan.values())
+        total_beban = sum(beban.values())
+        
+        # Hitung laba bersih
+        laba_bersih = hitung_laba_bersih()
+        
+        # Ambil data modal
+        modal_data = get_modal_data()
+        modal_awal = modal_data['modal_awal']
+        total_tambahan = modal_data['total_tambahan']
+        total_prive = modal_data['total_prive']
+        
+        # Hitung modal akhir
+        modal_akhir = modal_awal + total_tambahan - total_prive + laba_bersih
+        
+        # Hitung total utang + modal
+        total_utang_modal = total_utang + modal_akhir
+        
+        return {
+            'aset': aset,
+            'utang': utang,
+            'modal': modal,
+            'pendapatan': pendapatan,
+            'beban': beban,
+            'total_aset': total_aset,
+            'total_utang': total_utang,
+            'total_modal': total_modal,
+            'total_pendapatan': total_pendapatan,
+            'total_beban': total_beban,
+            'laba_bersih': laba_bersih,
+            'modal_awal': modal_awal,
+            'total_tambahan': total_tambahan,
+            'total_prive': total_prive,
+            'modal_akhir': modal_akhir,
+            'total_utang_modal': total_utang_modal,
+            'balanced': abs(total_aset - total_utang_modal) < 0.01
+        }
+        
+    except Exception as e:
+        logger.error(f"Error hitung_neraca_terintegrasi: {str(e)}")
+        return None
+
+def cek_keseimbangan_neraca():
+    """Cek keseimbangan neraca"""
+    try:
+        neraca_data = hitung_neraca_terintegrasi()
+        if not neraca_data:
+            return {'seimbang': False, 'pesan': 'Data tidak tersedia'}
+        
+        selisih = neraca_data['total_aset'] - neraca_data['total_utang_modal']
+        
+        return {
+            'seimbang': abs(selisih) < 0.01,
+            'selisih': selisih,
+            'total_aset': neraca_data['total_aset'],
+            'total_utang_modal': neraca_data['total_utang_modal'],
+            'pesan': f"Selisih: {selisih:.2f}"
+        }
+    except Exception as e:
+        logger.error(f"Error cek_keseimbangan_neraca: {str(e)}")
+        return {'seimbang': False, 'pesan': f'Error: {str(e)}'}
+
+
+# ============================================================
+# 🔹 ROUTE: Neraca Lajur (Worksheet)
 # ============================================================
 @app.route("/neraca-lajur")
 def neraca_lajur():
@@ -8245,6 +8172,53 @@ def neraca_lajur():
         # Filter: hapus Utang Beban 750k dan Beban Listrik, Air dan Telepon 750k
         jurnal_data = filter_akun_tidak_diinginkan(jurnal_data)
         
+        # Daftar akun standar sesuai permintaan
+        akun_standar = {
+            # Aset Lancar (1xxx)
+            '1100': 'Aset Lancar',
+            '1110': 'Kas',
+            '1130': 'Piutang Usaha',
+            '1140': 'Persediaan Barang Dagang',
+            '1150': 'Perlengkapan',
+            
+            # Aset Tetap (1xxx)
+            '1200': 'Aset Tetap',
+            '1210': 'Tanah',
+            '1220': 'Bangunan',
+            '1221': 'Akumulasi Penyusutan Bangunan',
+            '1230': 'Kendaraan',
+            '1231': 'Akumulasi Penyusutan Kendaraan',
+            '1240': 'Peralatan',
+            '1241': 'Akumulasi Penyusutan Peralatan',
+            
+            # Utang (2xxx)
+            '2000': 'Utang',
+            '2100': 'Utang',
+            '2200': 'Pendapatan ddm',
+            
+            # Modal (3xxx)
+            '3000': 'Modal',
+            '3100': 'Modal',
+            '3200': 'Prive Mas Angga',
+            '3300': 'Ikhtisar L/R',
+            
+            # Pendapatan (4xxx)
+            '4000': 'Pendapatan',
+            '4100': 'Penjualan',
+            '4200': 'Retur Penjualan',
+            '4300': 'Potongan Penjualan',
+            
+            # HPP & Pembelian (5xxx)
+            '5110': 'HPP',
+            '5200': 'Pembelian',
+            
+            # Beban (6xxx)
+            '6000': 'Beban',
+            '6100': 'Beban Perlengkapan',
+            '6200': 'Beban air, listrik dan telepon',
+            '6300': 'Beban Penyusutan'
+        }
+        
         # Kelompokkan per akun
         akun_data = {}
         
@@ -8253,8 +8227,21 @@ def neraca_lajur():
             debit = float(jurnal.get('debit', 0) or 0)
             kredit = float(jurnal.get('kredit', 0) or 0)
             
-            if akun_nama not in akun_data:
-                akun_data[akun_nama] = {
+            # Cari kode akun berdasarkan nama
+            kode_akun = None
+            for kode, nama in akun_standar.items():
+                if nama.lower() == akun_nama.lower():
+                    kode_akun = kode
+                    break
+            
+            # Jika tidak ditemukan, gunakan nama asli
+            if not kode_akun:
+                kode_akun = akun_nama
+            
+            if kode_akun not in akun_data:
+                akun_data[kode_akun] = {
+                    'nama_akun': akun_standar.get(kode_akun, akun_nama),
+                    'kode_akun': kode_akun,
                     # Kolom 1-2: Neraca Saldo
                     'neraca_debit': 0,
                     'neraca_kredit': 0,
@@ -8275,21 +8262,20 @@ def neraca_lajur():
             # Pisahkan antara jurnal biasa dan jurnal penyesuaian
             if jurnal.get('transaksi_type') == 'PENYESUAIAN':
                 # Jurnal penyesuaian
-                akun_data[akun_nama]['penyesuaian_debit'] += debit
-                akun_data[akun_nama]['penyesuaian_kredit'] += kredit
+                akun_data[kode_akun]['penyesuaian_debit'] += debit
+                akun_data[kode_akun]['penyesuaian_kredit'] += kredit
             else:
                 # Jurnal biasa (neraca saldo)
-                akun_data[akun_nama]['neraca_debit'] += debit
-                akun_data[akun_nama]['neraca_kredit'] += kredit
+                akun_data[kode_akun]['neraca_debit'] += debit
+                akun_data[kode_akun]['neraca_kredit'] += kredit
         
         # Hitung Neraca Saldo Setelah Penyesuaian (NSSP)
-        for akun_nama, data in akun_data.items():
+        for kode_akun, data in akun_data.items():
             data['nssp_debit'] = data['neraca_debit'] + data['penyesuaian_debit']
             data['nssp_kredit'] = data['neraca_kredit'] + data['penyesuaian_kredit']
             
             # Tentukan saldo akhir untuk klasifikasi
             saldo_nssp = data['nssp_debit'] - data['nssp_kredit']
-            akun_lower = akun_nama.lower()
             
             # Reset dulu
             data['laba_rugi_debit'] = 0
@@ -8297,34 +8283,43 @@ def neraca_lajur():
             data['posisi_keuangan_debit'] = 0
             data['posisi_keuangan_kredit'] = 0
             
-            # 1. AKUN NOMINAL (Laba Rugi) - periode berjalan
-            if any(keyword in akun_lower for keyword in ['pendapatan', 'penjualan', 'jasa', 'hasil']):
-                # Pendapatan: hanya di Kredit Laba Rugi
-                data['laba_rugi_kredit'] = abs(saldo_nssp) if saldo_nssp < 0 else 0
-                
-            elif any(keyword in akun_lower for keyword in ['beban', 'biaya', 'hpp', 'harga pokok', 'listrik', 'air', 'telepon', 'perlengkapan']):
-                # Beban: hanya di Debit Laba Rugi
-                data['laba_rugi_debit'] = saldo_nssp if saldo_nssp > 0 else 0
+            # Klasifikasi berdasarkan kode akun
+            kode_utama = kode_akun[:1] if len(kode_akun) >= 1 else '0'
             
-            # 2. AKUN RIIL (Laporan Posisi Keuangan) - permanen
-            elif any(keyword in akun_lower for keyword in ['kas', 'bank', 'piutang', 'persediaan', 'peralatan']):
-                # Aset: hanya di Debit Laporan Posisi Keuangan
-                data['posisi_keuangan_debit'] = saldo_nssp if saldo_nssp > 0 else 0
-                
-            elif any(keyword in akun_lower for keyword in ['utang', 'hutang']):
-                # Utang: hanya di Kredit Laporan Posisi Keuangan  
-                data['posisi_keuangan_kredit'] = abs(saldo_nssp) if saldo_nssp < 0 else 0
-                
-            elif any(keyword in akun_lower for keyword in ['modal', 'prive', 'ekuitas']):
-                # Modal: hanya di Kredit Laporan Posisi Keuangan
-                data['posisi_keuangan_kredit'] = abs(saldo_nssp) if saldo_nssp < 0 else 0
-            
-            else:
-                # Default: klasifikasi berdasarkan saldo NSSP
+            # Akun 1-3: Laporan Posisi Keuangan (Neraca)
+            if kode_utama in ['1', '2', '3']:
                 if saldo_nssp > 0:
                     data['posisi_keuangan_debit'] = saldo_nssp
                 else:
                     data['posisi_keuangan_kredit'] = abs(saldo_nssp)
+            
+            # Akun 4-6: Laporan Laba Rugi
+            elif kode_utama in ['4', '5', '6']:
+                if saldo_nssp > 0:
+                    data['laba_rugi_debit'] = saldo_nssp
+                else:
+                    data['laba_rugi_kredit'] = abs(saldo_nssp)
+            
+            else:
+                # Default classification based on account name
+                nama_akun_lower = data['nama_akun'].lower()
+                
+                # Akun Posisi Keuangan (Aset, Utang, Modal)
+                if any(keyword in nama_akun_lower for keyword in ['kas', 'bank', 'piutang', 'persediaan', 'perlengkapan', 'tanah', 'bangunan', 'kendaraan', 'peralatan', 'aset', 'utang', 'hutang', 'modal', 'prive']):
+                    if saldo_nssp > 0:
+                        data['posisi_keuangan_debit'] = saldo_nssp
+                    else:
+                        data['posisi_keuangan_kredit'] = abs(saldo_nssp)
+                
+                # Akun Laba Rugi (Pendapatan, Beban)
+                elif any(keyword in nama_akun_lower for keyword in ['pendapatan', 'penjualan', 'retur', 'potongan', 'hpp', 'pembelian', 'beban']):
+                    if saldo_nssp > 0:
+                        data['laba_rugi_debit'] = saldo_nssp
+                    else:
+                        data['laba_rugi_kredit'] = abs(saldo_nssp)
+        
+        # Urutkan akun berdasarkan kode akun
+        akun_terurut = sorted(akun_data.items(), key=lambda x: x[0])
         
         # Hitung totals untuk setiap kolom
         totals = {
@@ -8340,7 +8335,7 @@ def neraca_lajur():
             'posisi_keuangan_kredit': 0
         }
         
-        for data in akun_data.values():
+        for kode_akun, data in akun_terurut:
             for key in totals:
                 totals[key] += data.get(key, 0)
         
@@ -8351,14 +8346,19 @@ def neraca_lajur():
             except:
                 return "Rp 0"
         
-        # Generate table rows
+        # Generate table rows - hanya tampilkan akun yang memiliki saldo
         rows_html = ""
-        for akun_nama, data in sorted(akun_data.items()):
+        for kode_akun, data in akun_terurut:
             # Hanya tampilkan akun yang memiliki saldo di salah satu kolom
-            if any(data.values()):
+            if any([data['neraca_debit'], data['neraca_kredit'], 
+                   data['penyesuaian_debit'], data['penyesuaian_kredit'],
+                   data['nssp_debit'], data['nssp_kredit'],
+                   data['laba_rugi_debit'], data['laba_rugi_kredit'],
+                   data['posisi_keuangan_debit'], data['posisi_keuangan_kredit']]):
+                
                 rows_html += f"""
                 <tr>
-                    <td class="akun-name">{akun_nama}</td>
+                    <td class="akun-name">{kode_akun} - {data['nama_akun']}</td>
                     <td class="number">{rp(data['neraca_debit'])}</td>
                     <td class="number">{rp(data['neraca_kredit'])}</td>
                     <td class="number">{rp(data['penyesuaian_debit'])}</td>
@@ -8382,6 +8382,10 @@ def neraca_lajur():
         
         # Hitung Laba/Rugi
         laba_rugi = totals['laba_rugi_kredit'] - totals['laba_rugi_debit']
+        
+        # Hitung selisih untuk footer
+        selisih_laba_rugi = totals['laba_rugi_kredit'] - totals['laba_rugi_debit']
+        selisih_posisi_keuangan = totals['posisi_keuangan_debit'] - totals['posisi_keuangan_kredit']
         
         # Debug info
         logger.info(f"🔍 DEBUG NERACA LAJUR:")
@@ -8724,7 +8728,7 @@ def neraca_lajur():
                         <table class="worksheet-table">
                             <thead>
                                 <tr>
-                                    <th rowspan="2">Nama Akun</th>
+                                    <th rowspan="2">Kode & Nama Akun</th>
                                     <th colspan="2" class="column-group">Neraca Saldo</th>
                                     <th colspan="2" class="column-group">Penyesuaian</th>
                                     <th colspan="2" class="column-group">NSSP</th>
@@ -8810,8 +8814,8 @@ def neraca_lajur():
                                 <tr class="laba-rugi-section">
                                     <td><strong>SELISIH LABA RUGI</strong></td>
                                     <td colspan="6"></td>
-                                    <td colspan="2" class="number {'positive' if laba_rugi >= 0 else 'negative'}">
-                                        <strong>{rp(abs(laba_rugi))} {'(Laba)' if laba_rugi >= 0 else '(Rugi)'}</strong>
+                                    <td colspan="2" class="number {'positive' if selisih_laba_rugi >= 0 else 'negative'}">
+                                        <strong>{rp(abs(selisih_laba_rugi))} {'(Laba)' if selisih_laba_rugi >= 0 else '(Rugi)'}</strong>
                                     </td>
                                     <td colspan="2"></td>
                                 </tr>
@@ -8828,8 +8832,8 @@ def neraca_lajur():
                                 <tr class="posisi-keuangan-section">
                                     <td><strong>SELISIH LAPORAN POSISI KEUANGAN</strong></td>
                                     <td colspan="8"></td>
-                                    <td colspan="2" class="number {'positive' if (totals['posisi_keuangan_debit'] - totals['posisi_keuangan_kredit']) >= 0 else 'negative'}">
-                                        <strong>{rp(abs(totals['posisi_keuangan_debit'] - totals['posisi_keuangan_kredit']))}</strong>
+                                    <td colspan="2" class="number {'positive' if selisih_posisi_keuangan >= 0 else 'negative'}">
+                                        <strong>{rp(abs(selisih_posisi_keuangan))}</strong>
                                     </td>
                                 </tr>
                                 
@@ -8889,478 +8893,7 @@ def neraca_lajur():
         </body>
         </html>
         """
-            
-# ============================================================
-# 🔹 FUNGSI HITUNG NERACA TERINTEGRASI
-# ============================================================
-
-def hitung_neraca_terintegrasi():
-    """Hitung neraca dari data terintegrasi termasuk modal"""
-    try:
-        # Ambil data neraca lajur 
-        neraca_data = get_neraca_lajur()
-        
-        if not neraca_data or 'akun_data' not in neraca_data:
-            return None
-
-        akun_data = neraca_data['akun_data']
-        
-        # Kelompokkan akun untuk neraca
-        aset = {}
-        utang = {}
-        modal = {}
-        pendapatan = {}
-        beban = {}
-        
-        for akun_nama, data in akun_data.items():
-            saldo_akhir = data.get('neraca_debit', 0) - data.get('neraca_kredit', 0)
-            akun_lower = akun_nama.lower()
-            
-            # Klasifikasi akun
-            if any(keyword in akun_lower for keyword in ['kas', 'bank', 'piutang', 'persediaan', 'peralatan']):
-                aset[akun_nama] = max(0, saldo_akhir)
-            elif any(keyword in akun_lower for keyword in ['utang', 'hutang']):
-                utang[akun_nama] = max(0, -saldo_akhir)
-            elif any(keyword in akun_lower for keyword in ['modal', 'prive']):
-                modal[akun_nama] = max(0, -saldo_akhir)
-            elif any(keyword in akun_lower for keyword in ['pendapatan', 'penjualan']):
-                pendapatan[akun_nama] = max(0, -saldo_akhir)
-            elif any(keyword in akun_lower for keyword in ['beban', 'hpp', 'biaya']):
-                beban[akun_nama] = max(0, saldo_akhir)
-
-        # Hitung totals
-        total_aset = sum(aset.values())
-        total_utang = sum(utang.values())
-        total_modal = sum(modal.values())
-        total_pendapatan = sum(pendapatan.values())
-        total_beban = sum(beban.values())
-        
-        # Hitung laba bersih
-        laba_bersih = total_pendapatan - total_beban
-        
-        # Ambil data modal dari database
-        modal_data = get_modal_data()
-        modal_awal = modal_data['modal_awal']
-        total_tambahan = modal_data['total_tambahan']
-        total_prive = modal_data['total_prive']
-        
-        # Hitung modal akhir
-        modal_akhir = modal_awal + total_tambahan - total_prive + laba_bersih
-        
-        # Hitung total utang + modal
-        total_utang_modal = total_utang + modal_akhir
-        
-        # Cek keseimbangan
-        balance_check = cek_keseimbangan_neraca()
-        
-        return {
-            'aset': aset,
-            'utang': utang,
-            'modal': modal,
-            'pendapatan': pendapatan,
-            'beban': beban,
-            'total_aset': total_aset,
-            'total_utang': total_utang,
-            'total_modal_awal': total_modal,
-            'total_pendapatan': total_pendapatan,
-            'total_beban': total_beban,
-            'laba_bersih': laba_bersih,
-            'modal_awal': modal_awal,
-            'total_tambahan': total_tambahan,
-            'total_prive': total_prive,
-            'modal_akhir': modal_akhir,
-            'total_utang_modal': total_utang_modal,
-            'balanced': balance_check['seimbang'] if balance_check else False,
-            'balance_check': balance_check
-        }
-        
-    except Exception as e:
-        logger.error(f"Error hitung_neraca_terintegrasi: {str(e)}")
-        return None
-
-
-# ============================================================
-# 🔹 ROUTE: Debug Neraca 
-# ============================================================
-
-@app.route("/debug-neraca")
-def debug_neraca():
-    """Route untuk debug data neraca"""
-    if not session.get('logged_in'):
-        return redirect('/login')
-    
-    # Ambil data jurnal
-    jurnal_result = supabase.table("jurnal_umum").select("*").execute()
-    jurnal_data = jurnal_result.data or []
-    
-    # Ambil data dengan function sederhana
-    neraca_data = get_neraca_lajur_simple()
-    
-    # Ambil data transaksi untuk referensi
-    penjualan_result = supabase.table("penjualan").select("*").execute()
-    pembelian_result = supabase.table("pembelian").select("*").execute()
-    operasional_result = supabase.table("operasional").select("*").execute()
-    
-    debug_html = f"""
-    <html>
-    <head>
-        <title>Debug Neraca</title>
-        <style>
-            body {{ font-family: Arial; padding: 20px; }}
-            .section {{ margin: 20px 0; padding: 15px; border: 1px solid #ddd; }}
-            pre {{ background: #f5f5f5; padding: 10px; overflow: auto; }}
-        </style>
-    </head>
-    <body>
-        <h1>🔧 Debug Data Neraca Lajur</h1>
-        <a href="/neraca-lajur">← Kembali ke Neraca Lajur</a>
-        
-        <div class="section">
-            <h2>📊 Summary Data</h2>
-            <ul>
-                <li>Jurnal: {len(jurnal_data)} entri</li>
-                <li>Penjualan: {len(penjualan_result.data or [])} transaksi</li>
-                <li>Pembelian: {len(pembelian_result.data or [])} transaksi</li>
-                <li>Operasional: {len(operasional_result.data or [])} transaksi</li>
-                <li>Akun Neraca: {len(neraca_data.get('akun_data', {}))} akun</li>
-            </ul>
-        </div>
-        
-        <div class="section">
-            <h2>📝 Data Jurnal ({len(jurnal_data)} entri):</h2>
-            <pre>{json.dumps(jurnal_data, indent=2, ensure_ascii=False, default=str)}</pre>
-        </div>
-        
-        <div class="section">
-            <h2>📊 Data Neraca Lajur:</h2>
-            <pre>{json.dumps(neraca_data, indent=2, ensure_ascii=False, default=str)}</pre>
-        </div>
-        
-        <div class="section">
-            <h2>🔧 Aksi Cepat</h2>
-            <a href="/generate-jurnal-otomatis" style="background: #ff66a3; color: white; padding: 10px; text-decoration: none; border-radius: 5px;">
-                🔄 Generate Ulang Semua Jurnal
-            </a>
-        </div>
-    </body>
-    </html>
-    """
-    
-    return debug_html
-
-@app.route("/debug-data")
-def debug_data():
-    """Debug route untuk melihat data sebenarnya di Supabase"""
-    if not session.get('logged_in'):
-        return redirect('/login')
-    
-    try:
-        # Ambil semua data dari berbagai tabel
-        jurnal_data = supabase.table("jurnal_umum").select("*").execute().data or []
-        penjualan_data = supabase.table("penjualan").select("*").execute().data or []
-        pembelian_data = supabase.table("pembelian").select("*").execute().data or []
-        operasional_data = supabase.table("operasional").select("*").execute().data or []
-        
-        debug_html = f"""
-        <html>
-        <head><title>Debug Data</title></head>
-        <body style="font-family: Arial; padding: 20px;">
-            <h1>🔧 Debug Data Supabase</h1>
-            <a href="/neraca-lajur">← Kembali ke Neraca Lajur</a>
-            
-            <h2>📊 Summary Data</h2>
-            <ul>
-                <li>Jurnal Umum: {len(jurnal_data)} entri</li>
-                <li>Penjualan: {len(penjualan_data)} transaksi</li>
-                <li>Pembelian: {len(pembelian_data)} transaksi</li>
-                <li>Operasional: {len(operasional_data)} transaksi</li>
-            </ul>
-            
-            <h2>📝 Data Jurnal Umum</h2>
-            <table border="1" style="border-collapse: collapse; width: 100%;">
-                <tr>
-                    <th>ID</th><th>Tanggal</th><th>Akun</th><th>Debit</th><th>Kredit</th><th>Type</th>
-                </tr>
-                {"".join([f"""
-                <tr>
-                    <td>{j.get('id')}</td>
-                    <td>{j.get('tanggal')}</td>
-                    <td>{j.get('nama_akun')}</td>
-                    <td>{j.get('debit')}</td>
-                    <td>{j.get('kredit')}</td>
-                    <td>{j.get('transaksi_type')}</td>
-                </tr>
-                """ for j in jurnal_data])}
-            </table>
-            
-            <h2>🔧 Quick Fix</h2>
-            <a href="/generate-jurnal-otomatis" style="background: #ff66a3; color: white; padding: 10px; text-decoration: none; border-radius: 5px;">
-                🔄 Generate Ulang Jurnal dari Transaksi
-            </a>
-        </body>
-        </html>
-        """
-        return debug_html
-        
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-def hitung_laba_bersih():
-    """Hitung laba bersih langsung dari database"""
-    try:
-        # Ambil semua data jurnal
-        jurnal_data = supabase.table("jurnal_umum").select("*").execute().data or []
-        
-        total_pendapatan = 0
-        total_beban = 0
-        
-        for jurnal in jurnal_data:
-            akun_nama = jurnal.get('nama_akun', '').lower()
-            
-            # Klasifikasi akun pendapatan dan beban
-            if any(keyword in akun_nama for keyword in ['pendapatan', 'penjualan', 'jasa']):
-                total_pendapatan += jurnal.get('kredit', 0) - jurnal.get('debit', 0)
-            elif any(keyword in akun_nama for keyword in ['beban', 'hpp', 'biaya', 'gaji', 'listrik', 'pakan', 'obat']):
-                total_beban += jurnal.get('debit', 0) - jurnal.get('kredit', 0)
-        
-        laba_bersih = total_pendapatan - total_beban
-        return laba_bersih
-        
-    except Exception as e:
-        logger.error(f"Error hitung laba bersih: {str(e)}")
-        return 0
-
-# ============================================================
-# 🔹 FUNGSI BANTUAN NERACA LAJUR 
-# ============================================================
-
-def get_neraca_lajur_simple():
-    
-    try:
-        # Ambil semua data jurnal
-        jurnal_result = supabase.table("jurnal_umum").select("*").order("tanggal").execute()
-        jurnal_data = jurnal_result.data or []
-        
-        # Kelompokkan per akun
-        akun_data = {}
-        
-        for jurnal in jurnal_data:
-            akun_nama = jurnal.get('nama_akun', 'Unknown')
-            debit = float(jurnal.get('debit', 0) or 0)
-            kredit = float(jurnal.get('kredit', 0) or 0)
-            
-            if akun_nama not in akun_data:
-                akun_data[akun_nama] = {
-                    'neraca_debit': 0,
-                    'neraca_kredit': 0,
-                    'penyesuaian_debit': 0,
-                    'penyesuaian_kredit': 0,
-                    'nssp_debit': 0,
-                    'nssp_kredit': 0
-                }
-            
-            # Pisahkan antara jurnal biasa dan jurnal penyesuaian
-            if jurnal.get('transaksi_type') == 'PENYESUAIAN':
-                # Jurnal penyesuaian
-                akun_data[akun_nama]['penyesuaian_debit'] += debit
-                akun_data[akun_nama]['penyesuaian_kredit'] += kredit
-            else:
-                # Jurnal biasa (neraca saldo)
-                akun_data[akun_nama]['neraca_debit'] += debit
-                akun_data[akun_nama]['neraca_kredit'] += kredit
-        
-        # Hitung Neraca Saldo Setelah Penyesuaian (NSSP)
-        for akun_nama, data in akun_data.items():
-            data['nssp_debit'] = data['neraca_debit'] + data['penyesuaian_debit']
-            data['nssp_kredit'] = data['neraca_kredit'] + data['penyesuaian_kredit']
-        
-        return {
-            'akun_data': akun_data,
-            'total_jurnal': len(jurnal_data),
-            'total_akun': len(akun_data)
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Error di get_neraca_lajur_simple: {str(e)}")
-        return None
-
-def get_neraca_lajur():
-    
-    try:
-        # Ambil semua data jurnal
-        jurnal_result = supabase.table("jurnal_umum").select("*").order("tanggal").execute()
-        jurnal_data = jurnal_result.data or []
-        
-        # Kelompokkan per akun
-        akun_data = {}
-        
-        for jurnal in jurnal_data:
-            akun_nama = jurnal.get('nama_akun', 'Unknown')
-            debit = float(jurnal.get('debit', 0) or 0)
-            kredit = float(jurnal.get('kredit', 0) or 0)
-            
-            if akun_nama not in akun_data:
-                akun_data[akun_nama] = {
-                    # Kolom 1-2: Neraca Saldo
-                    'neraca_debit': 0,
-                    'neraca_kredit': 0,
-                    # Kolom 3-4: Penyesuaian
-                    'penyesuaian_debit': 0,
-                    'penyesuaian_kredit': 0,
-                    # Kolom 5-6: Neraca Saldo Setelah Penyesuaian
-                    'nssp_debit': 0,
-                    'nssp_kredit': 0,
-                    # Kolom 7-8: Laporan Laba Rugi
-                    'laba_rugi_debit': 0,
-                    'laba_rugi_kredit': 0,
-                    # Kolom 9-10: Posisi Keuangan (Neraca)
-                    'posisi_keuangan_debit': 0,
-                    'posisi_keuangan_kredit': 0
-                }
-            
-            # Pisahkan antara jurnal biasa dan jurnal penyesuaian
-            if jurnal.get('transaksi_type') == 'PENYESUAIAN':
-                akun_data[akun_nama]['penyesuaian_debit'] += debit
-                akun_data[akun_nama]['penyesuaian_kredit'] += kredit
-            else:
-                akun_data[akun_nama]['neraca_debit'] += debit
-                akun_data[akun_nama]['neraca_kredit'] += kredit
-        
-        # Hitung Neraca Saldo Setelah Penyesuaian (NSSP)
-        for akun_nama, data in akun_data.items():
-            data['nssp_debit'] = data['neraca_debit'] + data['penyesuaian_debit']
-            data['nssp_kredit'] = data['neraca_kredit'] + data['penyesuaian_kredit']
-            
-            saldo_nssp = data['nssp_debit'] - data['nssp_kredit']
-            akun_lower = akun_nama.lower()
-            
-            # 1. AKUN NOMINAL (Laba Rugi) - periode berjalan
-            if any(keyword in akun_lower for keyword in ['pendapatan', 'penjualan', 'jasa', 'hasil']):
-                # Pendapatan: hanya di Kredit Laba Rugi (saldo kredit)
-                if saldo_nssp < 0:  # Saldo kredit (normal)
-                    data['laba_rugi_debit'] = 0
-                    data['laba_rugi_kredit'] = abs(saldo_nssp)
-                else:  # Saldo debit (tidak normal)
-                    data['laba_rugi_debit'] = saldo_nssp
-                    data['laba_rugi_kredit'] = 0
-                data['posisi_keuangan_debit'] = 0
-                data['posisi_keuangan_kredit'] = 0
                 
-            elif any(keyword in akun_lower for keyword in ['beban', 'biaya', 'hpp', 'gaji', 'listrik', 'air', 'telepon', 'sewa', 'pajak']):
-                # Beban: hanya di Debit Laba Rugi (saldo debit)
-                if saldo_nssp > 0:  # Saldo debit (normal)
-                    data['laba_rugi_debit'] = saldo_nssp
-                    data['laba_rugi_kredit'] = 0
-                else:  # Saldo kredit (tidak normal)
-                    data['laba_rugi_debit'] = 0
-                    data['laba_rugi_kredit'] = abs(saldo_nssp)
-                data['posisi_keuangan_debit'] = 0
-                data['posisi_keuangan_kredit'] = 0
-            
-            # 2. AKUN RIIL (Posisi Keuangan) - permanen
-            elif any(keyword in akun_lower for keyword in ['kas', 'bank', 'piutang', 'persediaan', 'peralatan', 'tanah', 'bangunan', 'kendaraan', 'aset']):
-                # Aset: hanya di Debit Posisi Keuangan
-                data['laba_rugi_debit'] = 0
-                data['laba_rugi_kredit'] = 0
-                if saldo_nssp > 0:  # Saldo debit (normal untuk aset)
-                    data['posisi_keuangan_debit'] = saldo_nssp
-                    data['posisi_keuangan_kredit'] = 0
-                else:  # Saldo kredit (tidak normal untuk aset)
-                    data['posisi_keuangan_debit'] = 0
-                    data['posisi_keuangan_kredit'] = abs(saldo_nssp)
-                
-            elif any(keyword in akun_lower for keyword in ['utang', 'hutang', 'kewajiban']):
-                # Utang: hanya di Kredit Posisi Keuangan
-                data['laba_rugi_debit'] = 0
-                data['laba_rugi_kredit'] = 0
-                if saldo_nssp < 0:  # Saldo kredit (normal untuk utang)
-                    data['posisi_keuangan_debit'] = 0
-                    data['posisi_keuangan_kredit'] = abs(saldo_nssp)
-                else:  # Saldo debit (tidak normal untuk utang)
-                    data['posisi_keuangan_debit'] = saldo_nssp
-                    data['posisi_keuangan_kredit'] = 0
-                    
-            elif any(keyword in akun_lower for keyword in ['modal', 'prive', 'ekuitas']):
-                # Modal: hanya di Kredit Posisi Keuangan
-                # Prive: hanya di Debit Posisi Keuangan
-                data['laba_rugi_debit'] = 0
-                data['laba_rugi_kredit'] = 0
-                if 'prive' in akun_lower:
-                    # Prive: debit (pengurangan modal)
-                    data['posisi_keuangan_debit'] = abs(saldo_nssp) if saldo_nssp != 0 else 0
-                    data['posisi_keuangan_kredit'] = 0
-                else:
-                    # Modal: kredit
-                    data['posisi_keuangan_debit'] = 0
-                    data['posisi_keuangan_kredit'] = abs(saldo_nssp) if saldo_nssp != 0 else 0
-            
-            else:
-                # Default: asumsikan akun neraca (posisi keuangan)
-                data['laba_rugi_debit'] = 0
-                data['laba_rugi_kredit'] = 0
-                if saldo_nssp > 0:
-                    data['posisi_keuangan_debit'] = saldo_nssp
-                    data['posisi_keuangan_kredit'] = 0
-                else:
-                    data['posisi_keuangan_debit'] = 0
-                    data['posisi_keuangan_kredit'] = abs(saldo_nssp)
-        
-        # Hitung totals
-        totals = {
-            'neraca_debit': 0, 'neraca_kredit': 0,
-            'penyesuaian_debit': 0, 'penyesuaian_kredit': 0,
-            'nssp_debit': 0, 'nssp_kredit': 0,
-            'laba_rugi_debit': 0, 'laba_rugi_kredit': 0,
-            'posisi_keuangan_debit': 0, 'posisi_keuangan_kredit': 0
-        }
-        
-        for data in akun_data.values():
-            for key in totals:
-                totals[key] += data.get(key, 0)
-        
-        # PERHITUNGAN KESEIMBANGAN 
-        neraca_saldo_balance = abs(totals['neraca_debit'] - totals['neraca_kredit']) < 0.01
-        nssp_balance = abs(totals['nssp_debit'] - totals['nssp_kredit']) < 0.01
-        
-        # Keseimbangan akhir: Laba Rugi = Selisih Posisi Keuangan
-        total_laba_rugi_debit = totals['laba_rugi_debit']
-        total_laba_rugi_kredit = totals['laba_rugi_kredit']
-        total_posisi_debit = totals['posisi_keuangan_debit']
-        total_posisi_kredit = totals['posisi_keuangan_kredit']
-        
-        # Laba/Rugi = Pendapatan - Beban
-        laba_rugi = total_laba_rugi_kredit - total_laba_rugi_debit
-        
-        # Dalam neraca lajur yang balance: Total Debit Posisi Keuangan + Total Debit Laba Rugi = Total Kredit Posisi Keuangan + Total Kredit Laba Rugi
-        total_debit_all = total_laba_rugi_debit + total_posisi_debit
-        total_kredit_all = total_laba_rugi_kredit + total_posisi_kredit
-        final_balance = abs(total_debit_all - total_kredit_all) < 0.01
-        
-        is_balanced = neraca_saldo_balance and nssp_balance and final_balance
-        
-        return {
-            'akun_data': akun_data,
-            'total_jurnal': len(jurnal_data),
-            'total_akun': len(akun_data),
-            'totals': totals,
-            'laba_rugi': laba_rugi,
-            'is_balanced': is_balanced,
-            'debug_info': {
-                'total_laba_rugi_debit': total_laba_rugi_debit,
-                'total_laba_rugi_kredit': total_laba_rugi_kredit,
-                'total_posisi_debit': total_posisi_debit,
-                'total_posisi_kredit': total_posisi_kredit,
-                'total_debit_all': total_debit_all,
-                'total_kredit_all': total_kredit_all
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Error di get_neraca_lajur: {str(e)}")
-        import traceback
-        logger.error(f"🔍 Traceback: {traceback.format_exc()}")
-        return None
-            
 # ============================================================
 # 🔹 ROUTE: Laporan Arus Kas 
 # ============================================================
