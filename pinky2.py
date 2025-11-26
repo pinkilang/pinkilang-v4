@@ -852,6 +852,8 @@ def dashboard():
                     <div class="menu-title">👥 Lain-lain</div>
                     <a href="/aset" class="menu-item"> Aset</a>
                     <a href="/prive" class="menu-item"> Prive</a>
+                     <a href="/pendapatan-diterima-dimuka" class="menu-item"> Pendapatan Diterima Dimuka</a>
+                      <a href="/neraca-saldo-awal" class="menu-item"> Neraca Saldo Awal</a>
                     <a href="/hapus-transaksi-massal" class="menu-item"> Hapus Transaksi</a>
                 </div>
             </div>
@@ -7414,61 +7416,6 @@ def create_error_page(title, message):
     """
 
 # ============================================================
-# 🔹 FUNGSI TERINTEGRASI: Neraca Lajur & NSSP - DIPERBAIKI
-# ============================================================
-
-def cek_keseimbangan_neraca():
-    """Fungsi untuk memastikan neraca selalu balance"""
-    try:
-        # Ambil semua data jurnal
-        jurnal_res = supabase.table("jurnal_umum").select("*").execute()
-        jurnal_data = jurnal_res.data or []
-        
-        # Filter utang beban 750k sebelum hitung total
-        jurnal_data = filter_akun_tidak_diinginkan(jurnal_data)
-        
-        total_debit = sum(j.get('debit', 0) for j in jurnal_data)
-        total_kredit = sum(j.get('kredit', 0) for j in jurnal_data)
-        
-        seimbang = abs(total_debit - total_kredit) < 0.01  # Tolerance untuk rounding
-        
-        return {
-            'total_debit': total_debit,
-            'total_kredit': total_kredit,
-            'seimbang': seimbang,
-            'selisih': total_debit - total_kredit
-        }
-    except Exception as e:
-        logger.error(f"❌ Error cek keseimbangan: {str(e)}")
-        return None
-
-def filter_akun_tidak_diinginkan(jurnal_data):
-    """Fungsi untuk menghapus akun-akun yang tidak diinginkan - DIPERBAIKI"""
-    try:
-        jurnal_filtered = []
-        
-        for jurnal in jurnal_data:
-            nama_akun = jurnal.get('nama_akun', '')
-            debit = float(jurnal.get('debit', 0) or 0)
-            kredit = float(jurnal.get('kredit', 0) or 0)
-            
-            # HAPUS UTANG BEBAN 750k dan BEBAN LISTRIK 750k - FIXED
-            if (nama_akun == 'Utang Beban' and kredit == 750000) or \
-               (nama_akun == 'Beban Listrik, Air dan Telepon' and debit == 750000):
-                logger.info(f"🚫 Filtered out: {nama_akun} - Debit: {debit}, Kredit: {kredit}")
-                continue
-            else:
-                # Tambahkan jurnal lain seperti biasa
-                jurnal_filtered.append(jurnal)
-        
-        logger.info(f"✅ Filter selesai: {len(jurnal_data)} -> {len(jurnal_filtered)} entri")
-        return jurnal_filtered
-        
-    except Exception as e:
-        logger.error(f"❌ Error filter akun: {str(e)}")
-        return jurnal_data
-
-# ============================================================
 # 🔹 ROUTE: Neraca Saldo Setelah Penyesuaian (NSSP) - DIPERBAIKI
 # ============================================================
 @app.route("/neraca-saldo-setelah-penyesuaian")
@@ -7993,66 +7940,401 @@ def get_neraca_lajur_simple():
         logger.error(f"❌ Error di get_neraca_lajur_simple: {str(e)}")
         return None
 
-def hitung_laba_bersih():
-    """Hitung laba bersih langsung dari database"""
+def hitung_laba_rugi():
+    """Hitung laba rugi dari data jurnal"""
     try:
         # Ambil semua data jurnal
-        jurnal_data = supabase.table("jurnal_umum").select("*").execute().data or []
-        
-        total_pendapatan = 0
-        total_beban = 0
-        
-        for jurnal in jurnal_data:
-            akun_nama = jurnal.get('nama_akun', '').lower()
-            debit = float(jurnal.get('debit', 0) or 0)
-            kredit = float(jurnal.get('kredit', 0) or 0)
-            
-            # Klasifikasi akun pendapatan dan beban
-            if any(keyword in akun_nama for keyword in ['pendapatan', 'penjualan', 'jasa']):
-                total_pendapatan += kredit - debit  # Pendapatan normalnya kredit
-            elif any(keyword in akun_nama for keyword in ['beban', 'hpp', 'biaya', 'gaji', 'listrik', 'pakan', 'obat']):
-                total_beban += debit - kredit  # Beban normalnya debit
-        
-        laba_bersih = total_pendapatan - total_beban
-        return laba_bersih
-        
-    except Exception as e:
-        logger.error(f"Error hitung_laba_bersih: {str(e)}")
-        return 0
-
-def get_modal_data():
-    """Ambil data modal dari database"""
-    try:
-        # Ambil data dari jurnal umum untuk modal dan prive
         jurnal_result = supabase.table("jurnal_umum").select("*").execute()
         jurnal_data = jurnal_result.data or []
         
-        modal_awal = 0
-        total_tambahan = 0
-        total_prive = 0
+        if not jurnal_data:
+            return None
         
+        # Inisialisasi variabel
+        pendapatan_total = 0
+        beban_total = 0
+        beban_penyusutan = 0
+        
+        # Hitung pendapatan dan beban
         for jurnal in jurnal_data:
-            akun_nama = jurnal.get('nama_akun', '').lower()
+            nama_akun = jurnal.get('nama_akun', '').lower()
             debit = float(jurnal.get('debit', 0) or 0)
             kredit = float(jurnal.get('kredit', 0) or 0)
             
-            if 'modal' in akun_nama and 'prive' not in akun_nama:
-                # Modal normalnya kredit
-                modal_awal += kredit - debit
-            elif 'prive' in akun_nama:
-                # Prive normalnya debit
-                total_prive += debit - kredit
+            # PENDAPATAN (akun pendapatan, penjualan, dll)
+            if any(keyword in nama_akun for keyword in ['pendapatan', 'penjualan', 'hasil', 'penerimaan', 'jasa']):
+                pendapatan_total += kredit  # Pendapatan di kredit
+            
+            # BEBAN (akun beban, biaya, dll)
+            elif any(keyword in nama_akun for keyword in ['beban', 'biaya', 'pengeluaran']):
+                beban_total += debit  # Beban di debit
+            
+            # BEBAN PENYUSUTAN (khusus)
+            if 'penyusutan' in nama_akun and debit > 0:
+                beban_penyusutan += debit
+        
+        laba_bersih = pendapatan_total - beban_total
         
         return {
-            'modal_awal': modal_awal,
-            'total_tambahan': total_tambahan,
-            'total_prive': total_prive
+            'pendapatan_total': pendapatan_total,
+            'beban_total': beban_total,
+            'beban_penyusutan': beban_penyusutan,
+            'laba_bersih': laba_bersih,
+            'periode': datetime.now().strftime('%B %Y').upper()
         }
         
     except Exception as e:
-        logger.error(f"Error get_modal_data: {str(e)}")
-        return {'modal_awal': 0, 'total_tambahan': 0, 'total_prive': 0}
+        logger.error(f"❌ Error hitung_laba_rugi: {str(e)}")
+        return None
 
+def hitung_arus_kas_final():
+    """Hitung arus kas dengan mengambil laba bersih dari laporan laba rugi"""
+    try:
+        # Ambil semua data jurnal
+        jurnal_result = supabase.table("jurnal_umum").select("*").execute()
+        jurnal_data = jurnal_result.data or []
+        
+        logger.info(f"📊 Memproses {len(jurnal_data)} entri jurnal untuk arus kas")
+        
+        if not jurnal_data:
+            return None
+        
+        # 🔥 PERBAIKAN: Ambil laba bersih dari fungsi hitung_laba_rugi
+        data_laba_rugi = hitung_laba_rugi()
+        if not data_laba_rugi:
+            laba_bersih = 0
+            beban_penyusutan = 0
+        else:
+            laba_bersih = data_laba_rugi.get('laba_bersih', 0)
+            beban_penyusutan = data_laba_rugi.get('beban_penyusutan', 0)
+        
+        # Inisialisasi variabel
+        data = {
+            # 🔥 PERBAIKAN: Gunakan laba bersih dari laporan laba rugi
+            'laba_bersih': laba_bersih,
+            'beban_penyusutan': beban_penyusutan,
+            
+            # Perubahan modal kerja
+            'perubahan_persediaan': 0,
+            'perubahan_perlengkapan': 0,
+            'perubahan_utang_dagang': 0,
+            'perubahan_piutang': 0,
+            
+            # Aktivitas investasi
+            'pembelian_aset': 0,
+            'penjualan_aset': 0,
+            
+            # Aktivitas pendanaan
+            'tambahan_modal': 0,
+            'prive': 0,
+            'pinjaman': 0,
+            'pelunasan_pinjaman': 0,
+            
+            # Saldo kas
+            'saldo_kas_awal': 150885000,  # Rp 150.885.000
+            'periode': datetime.now().strftime('%B %Y').upper(),
+            'jurnal_diproses': len(jurnal_data)
+        }
+        
+        # HITUNG PERUBAHAN MODAL KERJA DARI TRANSAKSI KAS
+        for jurnal in jurnal_data:
+            nama_akun = jurnal.get('nama_akun', '').lower()
+            debit = float(jurnal.get('debit', 0) or 0)
+            kredit = float(jurnal.get('kredit', 0) or 0)
+            deskripsi = jurnal.get('deskripsi', '').lower()
+            
+            # TRANSAKSI YANG MEMPENGARUHI KAS
+            if 'kas' in nama_akun:
+                # PENERIMAAN KAS (debit di kas)
+                if debit > 0:
+                    # Penerimaan piutang
+                    if any(keyword in deskripsi for keyword in ['piutang', 'pelunasan']):
+                        data['perubahan_piutang'] += debit
+                
+                # PENGELUARAN KAS (kredit di kas)
+                elif kredit > 0:
+                    # Pembelian persediaan tunai
+                    if any(keyword in deskripsi for keyword in ['beli', 'pembelian', 'persediaan']):
+                        data['perubahan_persediaan'] += kredit
+                    
+                    # Pembayaran utang
+                    elif any(keyword in deskripsi for keyword in ['utang', 'hutang', 'bayar utang']):
+                        data['perubahan_utang_dagang'] += kredit
+                    
+                    # Pembelian perlengkapan
+                    elif any(keyword in deskripsi for keyword in ['perlengkapan', 'alat']):
+                        data['perubahan_perlengkapan'] += kredit
+        
+        # IDENTIFIKASI TRANSAKSI KHUSUS
+        for jurnal in jurnal_data:
+            nama_akun = jurnal.get('nama_akun', '').lower()
+            debit = float(jurnal.get('debit', 0) or 0)
+            kredit = float(jurnal.get('kredit', 0) or 0)
+            deskripsi = jurnal.get('deskripsi', '').lower()
+            
+            # AKTIVITAS INVESTASI
+            if any(keyword in nama_akun for keyword in ['aset', 'peralatan', 'kendaraan', 'mesin', 'bangunan']):
+                if 'kas' in nama_akun:
+                    if debit > 0:  # Penjualan aset
+                        data['penjualan_aset'] += debit
+                    elif kredit > 0:  # Pembelian aset
+                        data['pembelian_aset'] += kredit
+                else:
+                    # Jika bukan kas, cek dari deskripsi
+                    if any(keyword in deskripsi for keyword in ['beli aset', 'pembelian aset', 'beli peralatan']):
+                        data['pembelian_aset'] += kredit
+                    elif any(keyword in deskripsi for keyword in ['jual aset', 'penjualan aset']):
+                        data['penjualan_aset'] += debit
+            
+            # AKTIVITAS PENDANAAN
+            elif 'prive' in nama_akun and kredit > 0:
+                data['prive'] += kredit
+            
+            elif any(keyword in deskripsi for keyword in ['modal', 'tambahan modal', 'setor modal']):
+                if kredit > 0:
+                    data['tambahan_modal'] += kredit
+            
+            elif any(keyword in deskripsi for keyword in ['pinjaman', 'hutang', 'utang bank']):
+                if kredit > 0:  # Penerimaan pinjaman
+                    data['pinjaman'] += kredit
+                elif debit > 0:  # Pelunasan pinjaman
+                    data['pelunasan_pinjaman'] += debit
+        
+        # HITUNG ARUS KAS OPERASI (Metode Tidak Langsung)
+        total_penambah = data['beban_penyusutan'] + data['perubahan_persediaan'] + data['perubahan_perlengkapan'] + data['perubahan_piutang']
+        total_pengurang = data['perubahan_utang_dagang']
+        
+        arus_kas_operasi = data['laba_bersih'] + total_penambah - total_pengurang
+        
+        # HITUNG ARUS KAS INVESTASI
+        arus_kas_investasi = data['penjualan_aset'] - data['pembelian_aset']
+        
+        # HITUNG ARUS KAS PENDANAAN
+        arus_kas_pendanaan = data['tambahan_modal'] + data['pinjaman'] - data['prive'] - data['pelunasan_pinjaman']
+        
+        # HITUNG KENAIKAN BERSIH KAS DAN SALDO AKHIR
+        kenaikan_bersih_kas = arus_kas_operasi + arus_kas_investasi + arus_kas_pendanaan
+        saldo_kas_akhir = data['saldo_kas_awal'] + kenaikan_bersih_kas
+        
+        # Siapkan data untuk return
+        result = {
+            **data,
+            'total_penambah': total_penambah,
+            'total_pengurang': total_pengurang,
+            'arus_kas_operasi': arus_kas_operasi,
+            'arus_kas_investasi': arus_kas_investasi,
+            'arus_kas_pendanaan': arus_kas_pendanaan,
+            'kenaikan_bersih_kas': kenaikan_bersih_kas,
+            'saldo_kas_akhir': saldo_kas_akhir
+        }
+        
+        logger.info(f"📊 Arus Kas Final:")
+        logger.info(f"   Laba Bersih (dari laba rugi): {data['laba_bersih']}")
+        logger.info(f"   Beban Penyusutan: {data['beban_penyusutan']}")
+        logger.info(f"   Perubahan Persediaan: {data['perubahan_persediaan']}")
+        logger.info(f"   Arus Kas Operasi: {arus_kas_operasi}")
+        logger.info(f"   Kenaikan Bersih: {kenaikan_bersih_kas}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Error hitung_arus_kas_final: {str(e)}")
+        import traceback
+        logger.error(f"🔍 Traceback: {traceback.format_exc()}")
+        return None
+
+def hitung_laba_bersih():
+    """Hitung laba bersih dari data jurnal"""
+    try:
+        # Ambil semua data jurnal
+        jurnal_result = supabase.table("jurnal_umum").select("*").execute()
+        jurnal_data = jurnal_result.data or []
+        
+        if not jurnal_data:
+            return 0
+        
+        # Inisialisasi variabel
+        pendapatan_total = 0
+        beban_total = 0
+        
+        # Hitung pendapatan dan beban
+        for jurnal in jurnal_data:
+            nama_akun = jurnal.get('nama_akun', '').lower()
+            debit = float(jurnal.get('debit', 0) or 0)
+            kredit = float(jurnal.get('kredit', 0) or 0)
+            
+            # PENDAPATAN (akun pendapatan, penjualan, dll)
+            if any(keyword in nama_akun for keyword in ['pendapatan', 'penjualan', 'hasil', 'penerimaan', 'jasa']):
+                pendapatan_total += kredit  # Pendapatan di kredit
+            
+            # BEBAN (akun beban, biaya, dll)
+            elif any(keyword in nama_akun for keyword in ['beban', 'biaya', 'pengeluaran']):
+                beban_total += debit  # Beban di debit
+        
+        laba_bersih = pendapatan_total - beban_total
+        
+        logger.info(f"📊 Laba Bersih: Pendapatan={pendapatan_total}, Beban={beban_total}, Laba={laba_bersih}")
+        
+        return laba_bersih
+        
+    except Exception as e:
+        logger.error(f"❌ Error hitung_laba_bersih: {str(e)}")
+        return 0
+
+def hitung_arus_kas_final():
+    """Hitung arus kas dengan mengambil laba bersih dari fungsi hitung_laba_bersih"""
+    try:
+        # Ambil semua data jurnal
+        jurnal_result = supabase.table("jurnal_umum").select("*").execute()
+        jurnal_data = jurnal_result.data or []
+        
+        logger.info(f"📊 Memproses {len(jurnal_data)} entri jurnal untuk arus kas")
+        
+        if not jurnal_data:
+            return None
+        
+        # 🔥 PERBAIKAN: Ambil laba bersih dari fungsi hitung_laba_bersih
+        laba_bersih = hitung_laba_bersih()
+        
+        # Inisialisasi variabel
+        data = {
+            # 🔥 PERBAIKAN: Gunakan laba bersih dari fungsi hitung_laba_bersih
+            'laba_bersih': laba_bersih,
+            'beban_penyusutan': 0,
+            
+            # Perubahan modal kerja
+            'perubahan_persediaan': 0,
+            'perubahan_perlengkapan': 0,
+            'perubahan_utang_dagang': 0,
+            'perubahan_piutang': 0,
+            
+            # Aktivitas investasi
+            'pembelian_aset': 0,
+            'penjualan_aset': 0,
+            
+            # Aktivitas pendanaan
+            'tambahan_modal': 0,
+            'prive': 0,
+            'pinjaman': 0,
+            'pelunasan_pinjaman': 0,
+            
+            # Saldo kas
+            'saldo_kas_awal': 150885000,  # Rp 150.885.000
+            'periode': datetime.now().strftime('%B %Y').upper(),
+            'jurnal_diproses': len(jurnal_data)
+        }
+        
+        # HITUNG BEBAN PENYUSUTAN DAN PERUBAHAN MODAL KERJA
+        for jurnal in jurnal_data:
+            nama_akun = jurnal.get('nama_akun', '').lower()
+            debit = float(jurnal.get('debit', 0) or 0)
+            kredit = float(jurnal.get('kredit', 0) or 0)
+            deskripsi = jurnal.get('deskripsi', '').lower()
+            
+            # BEBAN PENYUSUTAN
+            if 'penyusutan' in nama_akun and debit > 0:
+                data['beban_penyusutan'] += debit
+            
+            # TRANSAKSI YANG MEMPENGARUHI KAS
+            if 'kas' in nama_akun:
+                # PENERIMAAN KAS (debit di kas)
+                if debit > 0:
+                    # Penerimaan piutang
+                    if any(keyword in deskripsi for keyword in ['piutang', 'pelunasan']):
+                        data['perubahan_piutang'] += debit
+                
+                # PENGELUARAN KAS (kredit di kas)
+                elif kredit > 0:
+                    # Pembelian persediaan tunai
+                    if any(keyword in deskripsi for keyword in ['beli', 'pembelian', 'persediaan']):
+                        data['perubahan_persediaan'] += kredit
+                    
+                    # Pembayaran utang
+                    elif any(keyword in deskripsi for keyword in ['utang', 'hutang', 'bayar utang']):
+                        data['perubahan_utang_dagang'] += kredit
+                    
+                    # Pembelian perlengkapan
+                    elif any(keyword in deskripsi for keyword in ['perlengkapan', 'alat']):
+                        data['perubahan_perlengkapan'] += kredit
+        
+        # IDENTIFIKASI TRANSAKSI KHUSUS
+        for jurnal in jurnal_data:
+            nama_akun = jurnal.get('nama_akun', '').lower()
+            debit = float(jurnal.get('debit', 0) or 0)
+            kredit = float(jurnal.get('kredit', 0) or 0)
+            deskripsi = jurnal.get('deskripsi', '').lower()
+            
+            # AKTIVITAS INVESTASI
+            if any(keyword in nama_akun for keyword in ['aset', 'peralatan', 'kendaraan', 'mesin', 'bangunan']):
+                if 'kas' in nama_akun:
+                    if debit > 0:  # Penjualan aset
+                        data['penjualan_aset'] += debit
+                    elif kredit > 0:  # Pembelian aset
+                        data['pembelian_aset'] += kredit
+                else:
+                    # Jika bukan kas, cek dari deskripsi
+                    if any(keyword in deskripsi for keyword in ['beli aset', 'pembelian aset', 'beli peralatan']):
+                        data['pembelian_aset'] += kredit
+                    elif any(keyword in deskripsi for keyword in ['jual aset', 'penjualan aset']):
+                        data['penjualan_aset'] += debit
+            
+            # AKTIVITAS PENDANAAN
+            elif 'prive' in nama_akun and kredit > 0:
+                data['prive'] += kredit
+            
+            elif any(keyword in deskripsi for keyword in ['modal', 'tambahan modal', 'setor modal']):
+                if kredit > 0:
+                    data['tambahan_modal'] += kredit
+            
+            elif any(keyword in deskripsi for keyword in ['pinjaman', 'hutang', 'utang bank']):
+                if kredit > 0:  # Penerimaan pinjaman
+                    data['pinjaman'] += kredit
+                elif debit > 0:  # Pelunasan pinjaman
+                    data['pelunasan_pinjaman'] += debit
+        
+        # HITUNG ARUS KAS OPERASI (Metode Tidak Langsung)
+        total_penambah = data['beban_penyusutan'] + data['perubahan_persediaan'] + data['perubahan_perlengkapan'] + data['perubahan_piutang']
+        total_pengurang = data['perubahan_utang_dagang']
+        
+        arus_kas_operasi = data['laba_bersih'] + total_penambah - total_pengurang
+        
+        # HITUNG ARUS KAS INVESTASI
+        arus_kas_investasi = data['penjualan_aset'] - data['pembelian_aset']
+        
+        # HITUNG ARUS KAS PENDANAAN
+        arus_kas_pendanaan = data['tambahan_modal'] + data['pinjaman'] - data['prive'] - data['pelunasan_pinjaman']
+        
+        # HITUNG KENAIKAN BERSIH KAS DAN SALDO AKHIR
+        kenaikan_bersih_kas = arus_kas_operasi + arus_kas_investasi + arus_kas_pendanaan
+        saldo_kas_akhir = data['saldo_kas_awal'] + kenaikan_bersih_kas
+        
+        # Siapkan data untuk return
+        result = {
+            **data,
+            'total_penambah': total_penambah,
+            'total_pengurang': total_pengurang,
+            'arus_kas_operasi': arus_kas_operasi,
+            'arus_kas_investasi': arus_kas_investasi,
+            'arus_kas_pendanaan': arus_kas_pendanaan,
+            'kenaikan_bersih_kas': kenaikan_bersih_kas,
+            'saldo_kas_akhir': saldo_kas_akhir
+        }
+        
+        logger.info(f"📊 Arus Kas Final:")
+        logger.info(f"   Laba Bersih: {data['laba_bersih']}")
+        logger.info(f"   Beban Penyusutan: {data['beban_penyusutan']}")
+        logger.info(f"   Perubahan Persediaan: {data['perubahan_persediaan']}")
+        logger.info(f"   Arus Kas Operasi: {arus_kas_operasi}")
+        logger.info(f"   Kenaikan Bersih: {kenaikan_bersih_kas}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Error hitung_arus_kas_final: {str(e)}")
+        import traceback
+        logger.error(f"🔍 Traceback: {traceback.format_exc()}")
+        return None
+    
 def hitung_neraca_terintegrasi():
     """Hitung neraca dari data terintegrasi termasuk modal"""
     try:
@@ -8895,30 +9177,47 @@ def neraca_lajur():
         """
                 
 # ============================================================
-# 🔹 ROUTE: Laporan Arus Kas 
+# 🔹 ROUTE: Laporan Arus Kas - VERSI OTOMATIS
 # ============================================================
 @app.route("/arus-kas")
 def arus_kas():
     if not session.get('logged_in'):
         return redirect('/login')
     
-    user_email = session.get('user_email')
-    
     try:
-        # Ambil data arus kas dari semua transaksi
+        # Ambil data arus kas
         arus_kas_data = hitung_arus_kas_otomatis()
+        
+        # Jika tidak ada data, tampilkan pesan
+        if not arus_kas_data:
+            return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Laporan Arus Kas - PINKILANG</title>
+                <style>
+                    body { font-family: Arial, sans-serif; background: #f5f5f5; padding: 20px; }
+                    .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.1); text-align: center; }
+                    .back-btn { display: inline-block; padding: 10px 20px; background: #e91e63; color: white; text-decoration: none; border-radius: 5px; margin: 10px; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>💧 Laporan Arus Kas</h1>
+                    <p>Belum ada data transaksi untuk ditampilkan.</p>
+                    <p>Silakan tambah transaksi terlebih dahulu di menu Jurnal Umum.</p>
+                    <a href="/dashboard" class="back-btn">← Kembali ke Dashboard</a>
+                    <a href="/jurnal-umum" class="back-btn">📝 Ke Jurnal Umum</a>
+                </div>
+            </body>
+            </html>
+            """
         
         # Format currency helper
         def rp(amount):
-            return f"Rp {int(amount):,}".replace(",", ".")
+            return f"Rp{int(amount):,}".replace(",", ".")
         
-        # Generate HTML sections
-        aktivitas_operasi = generate_aktivitas_operasi(arus_kas_data, rp)
-        aktivitas_investasi = generate_aktivitas_investasi(arus_kas_data, rp)
-        aktivitas_pendanaan = generate_aktivitas_pendanaan(arus_kas_data, rp)
-        ringkasan_arus_kas = generate_ringkasan_arus_kas(arus_kas_data, rp)
-        grafik_arus_kas = generate_grafik_arus_kas(arus_kas_data, rp)
-        
+        # Generate HTML
         html = f"""
         <!DOCTYPE html>
         <html>
@@ -8933,26 +9232,37 @@ def arus_kas():
                 }}
                 
                 body {{
-                    font-family: 'Arial', sans-serif;
-                    background: linear-gradient(135deg, #e6f7ff, #f0f8ff);
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #f8b7d8 0%, #f48fb1 100%);
                     padding: 20px;
                     min-height: 100vh;
                 }}
                 
                 .container {{
-                    max-width: 1200px;
+                    max-width: 1000px;
                     margin: 0 auto;
                     background: white;
                     border-radius: 15px;
-                    box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+                    box-shadow: 0 20px 40px rgba(0,0,0,0.1);
                     overflow: hidden;
                 }}
                 
                 .header {{
-                    background: linear-gradient(135deg, #66b3ff, #4d94ff);
+                    background: linear-gradient(135deg, #e91e63, #ad1457);
                     color: white;
-                    padding: 25px;
+                    padding: 30px;
                     text-align: center;
+                    position: relative;
+                }}
+                
+                .header::before {{
+                    content: '';
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    right: 0;
+                    height: 4px;
+                    background: linear-gradient(90deg, #f8bbd0, #f48fb1, #e91e63, #ad1457);
                 }}
                 
                 .back-btn {{
@@ -8961,209 +9271,259 @@ def arus_kas():
                     background: rgba(255,255,255,0.2);
                     color: white;
                     text-decoration: none;
-                    border-radius: 8px;
+                    border-radius: 25px;
                     margin-bottom: 15px;
                     border: 1px solid rgba(255,255,255,0.3);
+                    font-size: 14px;
+                    transition: all 0.3s ease;
                 }}
                 
                 .back-btn:hover {{
                     background: rgba(255,255,255,0.3);
+                    transform: translateY(-2px);
                 }}
                 
                 h1 {{
                     font-size: 28px;
                     margin-bottom: 10px;
+                    font-weight: 700;
                 }}
                 
-                .content {{
-                    padding: 25px;
+                .company-name {{
+                    font-size: 20px;
+                    font-weight: 600;
+                    margin-bottom: 5px;
+                    opacity: 0.9;
                 }}
                 
-                .section {{
-                    margin: 25px 0;
-                    padding: 20px;
-                    background: #f8fbff;
-                    border-radius: 12px;
-                    border-left: 5px solid #66b3ff;
-                }}
-                
-                .section-title {{
-                    color: #66b3ff;
-                    font-size: 22px;
-                    margin-bottom: 20px;
-                    padding-bottom: 10px;
-                    border-bottom: 2px solid #e6f2ff;
-                }}
-                
-                .calculation-table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                    margin: 15px 0;
-                    background: white;
-                    border-radius: 8px;
-                    overflow: hidden;
-                    box-shadow: 0 4px 15px rgba(102,179,255,0.1);
-                }}
-                
-                .calculation-table th {{
-                    background: #66b3ff;
-                    color: white;
-                    padding: 12px;
-                    text-align: left;
-                    font-weight: bold;
-                }}
-                
-                .calculation-table td {{
-                    padding: 12px;
-                    border-bottom: 1px solid #e6f2ff;
-                }}
-                
-                .calculation-table tr:hover {{
-                    background: #f0f8ff;
-                }}
-                
-                .number {{
-                    text-align: right;
-                    font-family: 'Courier New', monospace;
-                    font-weight: bold;
-                }}
-                
-                .positive {{
-                    color: #00cc66;
-                }}
-                
-                .negative {{
-                    color: #ff6666;
-                }}
-                
-                .total-row {{
-                    background: #e6f2ff;
-                    font-weight: bold;
+                .period {{
                     font-size: 16px;
+                    opacity: 0.8;
+                    margin-bottom: 10px;
                 }}
                 
-                .subtotal-row {{
-                    background: #f0f8ff;
-                    font-weight: bold;
-                }}
-                
-                .info-box {{
-                    background: #e6f7ff;
-                    border: 1px solid #91d5ff;
-                    border-radius: 8px;
-                    padding: 15px;
-                    margin: 15px 0;
-                    color: #0066cc;
-                }}
-                
-                .stats-grid {{
+                .summary-cards {{
                     display: grid;
                     grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
                     gap: 15px;
                     margin: 20px 0;
                 }}
                 
-                .stat-card {{
+                .summary-card {{
                     background: white;
                     padding: 20px;
-                    border-radius: 10px;
+                    border-radius: 12px;
                     text-align: center;
-                    box-shadow: 0 4px 15px rgba(102,179,255,0.1);
-                    border: 1px solid #e6f2ff;
+                    box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+                    border-left: 4px solid #e91e63;
                 }}
                 
-                .stat-number {{
+                .summary-card.positive {{
+                    border-left-color: #4caf50;
+                }}
+                
+                .summary-card.negative {{
+                    border-left-color: #f44336;
+                }}
+                
+                .summary-number {{
                     font-size: 24px;
                     font-weight: bold;
-                    color: #66b3ff;
                     margin: 10px 0;
-                }}
-                
-                .stat-label {{
-                    color: #3399ff;
-                    font-size: 14px;
-                    font-weight: bold;
-                }}
-                
-                .chart-container {{
-                    background: white;
-                    padding: 20px;
-                    border-radius: 10px;
-                    margin: 20px 0;
-                    box-shadow: 0 4px 15px rgba(102,179,255,0.1);
-                }}
-                
-                .chart-bar {{
-                    display: flex;
-                    align-items: center;
-                    margin: 15px 0;
-                }}
-                
-                .chart-label {{
-                    width: 150px;
-                    font-weight: bold;
-                    color: #333;
-                }}
-                
-                .chart-bar-inner {{
-                    flex: 1;
-                    background: #e6f2ff;
-                    border-radius: 10px;
-                    height: 30px;
-                    margin: 0 15px;
-                    overflow: hidden;
-                }}
-                
-                .chart-bar-fill {{
-                    height: 100%;
-                    border-radius: 10px;
-                    transition: width 0.5s ease;
-                }}
-                
-                .chart-value {{
-                    width: 100px;
-                    text-align: right;
-                    font-weight: bold;
                     font-family: 'Courier New', monospace;
+                }}
+                
+                .summary-label {{
+                    color: #666;
+                    font-size: 14px;
+                    font-weight: 600;
+                }}
+                
+                .content {{
+                    padding: 30px;
+                }}
+                
+                .cash-flow-table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                    margin: 25px 0;
+                    font-size: 14px;
+                    background: white;
+                    border-radius: 12px;
+                    overflow: hidden;
+                    box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+                }}
+                
+                .cash-flow-table td {{
+                    padding: 12px 15px;
+                    border-bottom: 1px solid #f8f9fa;
+                }}
+                
+                .cash-flow-table .description {{
+                    padding-left: 25px;
+                    color: #2d3436;
+                    font-weight: 500;
+                }}
+                
+                .cash-flow-table .amount {{
+                    text-align: right;
+                    font-family: 'Courier New', monospace;
+                    font-weight: bold;
+                    width: 200px;
+                    border-left: 1px solid #f8f9fa;
+                }}
+                
+                .cash-flow-table .section-header {{
+                    background: linear-gradient(135deg, #f8bbd0, #f48fb1);
+                    color: #ad1457;
+                    font-weight: 700;
+                    font-size: 15px;
+                    border: none;
+                }}
+                
+                .cash-flow-table .section-header td {{
+                    padding: 15px;
+                    border: none;
+                }}
+                
+                .cash-flow-table .sub-header {{
+                    background: #fce4ec;
+                    font-weight: 600;
+                    color: #ad1457;
+                    font-size: 13px;
+                }}
+                
+                .cash-flow-table .sub-total {{
+                    background: #f8bbd0;
+                    font-weight: 700;
+                    border-top: 2px solid #f48fb1;
+                    border-bottom: 2px solid #f48fb1;
+                }}
+                
+                .cash-flow-table .grand-total {{
+                    background: linear-gradient(135deg, #4caf50, #66bb6a);
+                    color: white;
+                    font-weight: 700;
+                    font-size: 15px;
+                    border: none;
+                }}
+                
+                .cash-flow-table .grand-total td {{
+                    border: none;
+                    padding: 16px 15px;
+                }}
+                
+                .cash-flow-table .final-total {{
+                    background: linear-gradient(135deg, #e91e63, #ad1457);
+                    color: white;
+                    font-weight: 700;
+                    font-size: 16px;
+                    border: none;
+                }}
+                
+                .cash-flow-table .final-total td {{
+                    border: none;
+                    padding: 18px 15px;
+                }}
+                
+                .negative {{
+                    color: #f44336;
+                }}
+                
+                .positive {{
+                    color: #4caf50;
+                }}
+                
+                .action-buttons {{
+                    text-align: center;
+                    margin-top: 30px;
+                    padding-top: 20px;
+                    border-top: 1px solid #f8bbd0;
                 }}
                 
                 .btn {{
                     display: inline-block;
-                    padding: 10px 20px;
-                    background: #66b3ff;
+                    padding: 12px 24px;
+                    background: linear-gradient(135deg, #e91e63, #ad1457);
                     color: white;
                     text-decoration: none;
-                    border-radius: 5px;
-                    margin: 5px;
+                    border-radius: 25px;
+                    margin: 0 8px;
+                    font-size: 14px;
+                    font-weight: 600;
+                    border: none;
+                    cursor: pointer;
+                    transition: all 0.3s ease;
+                    box-shadow: 0 4px 15px rgba(233, 30, 99, 0.3);
                 }}
                 
                 .btn:hover {{
-                    background: #4d94ff;
+                    transform: translateY(-2px);
+                    box-shadow: 0 6px 20px rgba(233, 30, 99, 0.4);
                 }}
                 
-                .period-selector {{
-                    background: white;
+                .btn.print {{
+                    background: linear-gradient(135deg, #4caf50, #66bb6a);
+                    box-shadow: 0 4px 15px rgba(76, 175, 80, 0.3);
+                }}
+                
+                .info-box {{
+                    background: linear-gradient(135deg, #fce4ec, #f8bbd0);
+                    border-radius: 10px;
+                    padding: 20px;
+                    margin: 25px 0;
+                    font-size: 14px;
+                    border-left: 4px solid #e91e63;
+                    color: #ad1457;
+                }}
+                
+                .info-box strong {{
+                    color: #ad1457;
+                }}
+                
+                .stats-grid {{
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                    gap: 15px;
+                    margin: 20px 0;
+                    background: #fce4ec;
+                    padding: 20px;
+                    border-radius: 10px;
+                }}
+                
+                .stat-item {{
+                    text-align: center;
                     padding: 15px;
-                    border-radius: 8px;
-                    margin: 15px 0;
-                    text-align: center;
                 }}
                 
-                .empty-state {{
-                    text-align: center;
-                    padding: 40px;
-                    color: #999;
-                    font-style: italic;
+                .stat-value {{
+                    font-size: 18px;
+                    font-weight: bold;
+                    color: #ad1457;
+                    font-family: 'Courier New', monospace;
                 }}
                 
-                .cash-flow-positive {{
-                    background: #f0fff0;
-                    border-left: 5px solid #00cc66;
+                .stat-label {{
+                    font-size: 12px;
+                    color: #e91e63;
+                    margin-top: 5px;
                 }}
                 
-                .cash-flow-negative {{
-                    background: #fff0f0;
-                    border-left: 5px solid #ff6666;
+                @media print {{
+                    body {{
+                        background: white;
+                        padding: 0;
+                    }}
+                    .container {{
+                        box-shadow: none;
+                        margin: 0;
+                    }}
+                    .back-btn, .action-buttons {{
+                        display: none;
+                    }}
+                    .header {{
+                        background: #ad1457 !important;
+                    }}
                 }}
             </style>
         </head>
@@ -9172,50 +9532,51 @@ def arus_kas():
                 <!-- Header -->
                 <div class="header">
                     <a href="/dashboard" class="back-btn">← Kembali ke Dashboard</a>
-                    <h1>💧 Laporan Arus Kas</h1>
-                    <p>Terintegrasi Otomatis dengan Semua Transaksi - PINKILANG</p>
+                    <h1>💧 LAPORAN ARUS KAS</h1>
+                    <div class="company-name">RUMAH BIBIT MAS ANGGA</div>
+                    <div class="period">PERIODE {arus_kas_data['periode']}</div>
                 </div>
                 
                 <!-- Content -->
                 <div class="content">
-                    <!-- Ringkasan Arus Kas -->
-                    {ringkasan_arus_kas}
+                    <!-- Summary Cards -->
+                    <div class="summary-cards">
+                        <div class="summary-card {'positive' if arus_kas_data['arus_kas_operasi'] >= 0 else 'negative'}">
+                            <div class="summary-label">Arus Kas Operasi</div>
+                            <div class="summary-number {'positive' if arus_kas_data['arus_kas_operasi'] >= 0 else 'negative'}">{rp(arus_kas_data['arus_kas_operasi'])}</div>
+                        </div>
+                        <div class="summary-card {'positive' if arus_kas_data['arus_kas_investasi'] >= 0 else 'negative'}">
+                            <div class="summary-label">Arus Kas Investasi</div>
+                            <div class="summary-number {'positive' if arus_kas_data['arus_kas_investasi'] >= 0 else 'negative'}">{rp(arus_kas_data['arus_kas_investasi'])}</div>
+                        </div>
+                        <div class="summary-card {'positive' if arus_kas_data['arus_kas_pendanaan'] >= 0 else 'negative'}">
+                            <div class="summary-label">Arus Kas Pendanaan</div>
+                            <div class="summary-number {'positive' if arus_kas_data['arus_kas_pendanaan'] >= 0 else 'negative'}">{rp(arus_kas_data['arus_kas_pendanaan'])}</div>
+                        </div>
+                        <div class="summary-card {'positive' if arus_kas_data['kenaikan_bersih_kas'] >= 0 else 'negative'}">
+                            <div class="summary-label">Kenaikan Bersih Kas</div>
+                            <div class="summary-number {'positive' if arus_kas_data['kenaikan_bersih_kas'] >= 0 else 'negative'}">{rp(arus_kas_data['kenaikan_bersih_kas'])}</div>
+                        </div>
+                    </div>
+
+                    <!-- Tabel Arus Kas -->
+                    {generate_tabel_arus_kas_otomatis(arus_kas_data, rp)}
                     
-                    <!-- Aktivitas Operasi -->
-                    {aktivitas_operasi}
-                    
-                    <!-- Aktivitas Investasi -->
-                    {aktivitas_investasi}
-                    
-                    <!-- Aktivitas Pendanaan -->
-                    {aktivitas_pendanaan}
-                    
-                    <!-- Grafik Arus Kas -->
-                    {grafik_arus_kas}
-                    
-                    <!-- Action Buttons -->
-                    <div style="text-align: center; margin-top: 30px;">
-                        <a href="/jurnal-umum" class="btn">📝 Lihat Jurnal</a>
-                        <a href="/laba-rugi" class="btn">📊 Lihat Laba Rugi</a>
-                        <a href="/neraca" class="btn">🏦 Lihat Neraca</a>
-                        <button onclick="window.print()" class="btn">🖨️ Cetak Laporan</button>
+                    <!-- Info Box -->
+                    <div class="info-box">
+                        <strong>💡 Informasi:</strong> Laporan arus kas ini dihasilkan otomatis dari semua transaksi yang tercatat dalam sistem. 
+                        Data diperbarui real-time sesuai dengan entri jurnal yang dilakukan. Laporan mengikuti format standar akuntansi dengan metode tidak langsung.
                     </div>
                     
+                    <!-- Action Buttons -->
+                    <div class="action-buttons">
+                        <a href="/jurnal-umum" class="btn">📝 Lihat Jurnal Umum</a>
+                        <a href="/laba-rugi" class="btn">📈 Lihat Laba Rugi</a>
+                        <a href="/neraca" class="btn">🏦 Lihat Neraca</a>
+                        <button onclick="window.print()" class="btn print">🖨️ Cetak Laporan</button>
+                    </div>
                 </div>
             </div>
-                
-                // Animate chart bars
-                document.addEventListener('DOMContentLoaded', function() {{
-                    const bars = document.querySelectorAll('.chart-bar-fill');
-                    bars.forEach(bar => {{
-                        const targetWidth = bar.style.width;
-                        bar.style.width = '0%';
-                        setTimeout(() => {{
-                            bar.style.width = targetWidth;
-                        }}, 100);
-                    }});
-                }});
-            </script>
         </body>
         </html>
         """
@@ -9225,467 +9586,408 @@ def arus_kas():
         logger.error(f"❌ Error di laporan arus kas: {str(e)}")
         return create_error_page("Arus Kas", str(e))
 
-def hitung_arus_kas_otomatis():
-    """Hitung arus kas otomatis dari semua transaksi jurnal"""
+def hitung_laba_bersih_otomatis():
+    """Hitung laba bersih dari data jurnal yang ada"""
     try:
-        # Ambil semua data jurnal yang mempengaruhi kas
+        # Ambil semua data jurnal
         jurnal_result = supabase.table("jurnal_umum").select("*").execute()
         jurnal_data = jurnal_result.data or []
         
-        logger.info(f"📊 Memproses {len(jurnal_data)} entri jurnal untuk arus kas")
+        logger.info(f"🔍 Menghitung laba bersih dari {len(jurnal_data)} transaksi")
         
-        # Inisialisasi variabel
-        arus_kas_data = {
-            # Aktivitas Operasi
-            'penerimaan_kas': {
-                'penjualan_tunai': 0,
-                'penerimaan_piutang': 0,
-                'pendapatan_jasa': 0,
-                'lainnya_operasi': 0
-            },
-            'pengeluaran_operasi': {
-                'pembelian_tunai': 0,
-                'beban_operasional': 0,
-                'beban_gaji': 0,
-                'beban_listrik': 0,
-                'beban_lainnya': 0
-            },
+        pendapatan_total = 0
+        beban_total = 0
+        
+        for jurnal in jurnal_data:
+            nama_akun = jurnal.get('nama_akun', '').lower()
+            debit = float(jurnal.get('debit', 0) or 0)
+            kredit = float(jurnal.get('kredit', 0) or 0)
             
-            # Aktivitas Investasi
+            # PENDAPATAN - ada di sisi kredit
+            if any(keyword in nama_akun for keyword in ['pendapatan', 'penjualan', 'hasil', 'jasa']):
+                pendapatan_total += kredit
+            
+            # BEBAN - ada di sisi debit  
+            elif any(keyword in nama_akun for keyword in ['beban', 'biaya', 'hpp', 'pokok']):
+                beban_total += debit
+        
+        laba_bersih = pendapatan_total - beban_total
+        
+        logger.info(f"📊 Laba Bersih: {pendapatan_total} - {beban_total} = {laba_bersih}")
+        
+        return laba_bersih
+        
+    except Exception as e:
+        logger.error(f"❌ Error hitung_laba_bersih_otomatis: {str(e)}")
+        return 0
+
+def hitung_penyesuaian_arus_kas_otomatis():
+    """Hitung penyesuaian arus kas operasi dari transaksi"""
+    try:
+        jurnal_result = supabase.table("jurnal_umum").select("*").execute()
+        jurnal_data = jurnal_result.data or []
+        
+        penyesuaian = {
+            'beban_penyusutan': 0,
+            'perubahan_persediaan': 0,
+            'perubahan_perlengkapan': 0,
+            'perubahan_piutang': 0,
+            'perubahan_utang_dagang': 0
+        }
+        
+        for jurnal in jurnal_data:
+            nama_akun = jurnal.get('nama_akun', '').lower()
+            deskripsi = jurnal.get('deskripsi', '').lower()
+            debit = float(jurnal.get('debit', 0) or 0)
+            kredit = float(jurnal.get('kredit', 0) or 0)
+            
+            # 1. BEBAN PENYUSUTAN - non kas yang ditambahkan kembali
+            if 'penyusutan' in nama_akun and debit > 0:
+                penyesuaian['beban_penyusutan'] += debit
+            
+            # 2. PERUBAHAN PERSEDIAAN (pembelian persediaan mengurangi kas)
+            if 'persediaan' in nama_akun and debit > 0:
+                penyesuaian['perubahan_persediaan'] += debit
+            
+            # 3. PERUBAHAN PERLENGKAPAN (pembelian perlengkapan mengurangi kas)
+            if 'perlengkapan' in nama_akun and debit > 0:
+                penyesuaian['perubahan_perlengkapan'] += debit
+            
+            # 4. PERUBAHAN PIUTANG (penerimaan piutang menambah kas)
+            if 'piutang' in nama_akun and kredit > 0:
+                penyesuaian['perubahan_piutang'] += kredit
+            
+            # 5. PERUBAHAN UTANG (pembayaran utang mengurangi kas)
+            if any(keyword in nama_akun for keyword in ['utang', 'hutang']) and debit > 0:
+                penyesuaian['perubahan_utang_dagang'] += debit
+        
+        return penyesuaian
+        
+    except Exception as e:
+        logger.error(f"❌ Error hitung_penyesuaian_arus_kas_otomatis: {str(e)}")
+        return {
+            'beban_penyusutan': 0,
+            'perubahan_persediaan': 0,
+            'perubahan_perlengkapan': 0,
+            'perubahan_piutang': 0,
+            'perubahan_utang_dagang': 0
+        }
+
+def hitung_aktivitas_investasi_otomatis():
+    """Hitung aktivitas investasi dari transaksi"""
+    try:
+        jurnal_result = supabase.table("jurnal_umum").select("*").execute()
+        jurnal_data = jurnal_result.data or []
+        
+        aktivitas = {
             'pembelian_aset': 0,
-            'penjualan_aset': 0,
-            'investasi_lainnya': 0,
+            'penjualan_aset': 0
+        }
+        
+        for jurnal in jurnal_data:
+            nama_akun = jurnal.get('nama_akun', '').lower()
+            deskripsi = jurnal.get('deskripsi', '').lower()
+            debit = float(jurnal.get('debit', 0) or 0)
+            kredit = float(jurnal.get('kredit', 0) or 0)
             
-            # Aktivitas Pendanaan
+            # PEMBELIAN ASET (aset bertambah, kas berkurang)
+            if any(keyword in nama_akun for keyword in ['aset', 'peralatan', 'mesin', 'kendaraan', 'bangunan']):
+                if debit > 0:
+                    aktivitas['pembelian_aset'] += debit
+            
+            # PENJUALAN ASET (aset berkurang, kas bertambah)
+            if any(keyword in nama_akun for keyword in ['aset', 'peralatan', 'mesin', 'kendaraan', 'bangunan']):
+                if kredit > 0:
+                    aktivitas['penjualan_aset'] += kredit
+        
+        return aktivitas
+        
+    except Exception as e:
+        logger.error(f"❌ Error hitung_aktivitas_investasi_otomatis: {str(e)}")
+        return {'pembelian_aset': 0, 'penjualan_aset': 0}
+
+def hitung_aktivitas_pendanaan_otomatis():
+    """Hitung aktivitas pendanaan dari transaksi"""
+    try:
+        jurnal_result = supabase.table("jurnal_umum").select("*").execute()
+        jurnal_data = jurnal_result.data or []
+        
+        aktivitas = {
             'tambahan_modal': 0,
             'prive': 0,
             'pinjaman': 0,
             'pelunasan_pinjaman': 0
         }
         
-        # Proses setiap entri jurnal
         for jurnal in jurnal_data:
             nama_akun = jurnal.get('nama_akun', '').lower()
+            deskripsi = jurnal.get('deskripsi', '').lower()
             debit = float(jurnal.get('debit', 0) or 0)
             kredit = float(jurnal.get('kredit', 0) or 0)
-            deskripsi = jurnal.get('deskripsi', '').lower()
-            transaksi_type = jurnal.get('transaksi_type', '')
             
-            # 🔍 IDENTIFIKASI TRANSAKSI KAS
-            if 'kas' in nama_akun:
-                # Kas bertambah (debit) = penerimaan kas
-                # Kas berkurang (kredit) = pengeluaran kas
-                
-                # 🎯 AKTIVITAS OPERASI
-                if any(keyword in deskripsi for keyword in ['penjualan', 'jual', 'pendapatan']):
-                    if debit > 0:  # Penerimaan kas dari penjualan
-                        arus_kas_data['penerimaan_kas']['penjualan_tunai'] += debit
-                
-                elif any(keyword in deskripsi for keyword in ['piutang', 'pelunasan']):
-                    if debit > 0:  # Penerimaan piutang
-                        arus_kas_data['penerimaan_kas']['penerimaan_piutang'] += debit
-                
-                elif any(keyword in deskripsi for keyword in ['jasa', 'service']):
-                    if debit > 0:  # Pendapatan jasa
-                        arus_kas_data['penerimaan_kas']['pendapatan_jasa'] += debit
-                
-                elif any(keyword in deskripsi for keyword in ['pembelian', 'beli']):
-                    if kredit > 0:  # Pengeluaran untuk pembelian
-                        arus_kas_data['pengeluaran_operasi']['pembelian_tunai'] += kredit
-                
-                elif any(keyword in deskripsi for keyword in ['beban', 'biaya']):
-                    if kredit > 0:  # Pengeluaran beban
-                        if 'gaji' in deskripsi:
-                            arus_kas_data['pengeluaran_operasi']['beban_gaji'] += kredit
-                        elif any(keyword in deskripsi for keyword in ['listrik', 'air', 'telepon']):
-                            arus_kas_data['pengeluaran_operasi']['beban_listrik'] += kredit
-                        else:
-                            arus_kas_data['pengeluaran_operasi']['beban_operasional'] += kredit
-                
-                # 🎯 AKTIVITAS INVESTASI
-                elif any(keyword in deskripsi for keyword in ['aset', 'peralatan', 'kendaraan', 'bangunan']):
-                    if kredit > 0:  # Pembelian aset
-                        arus_kas_data['pembelian_aset'] += kredit
-                    elif debit > 0:  # Penjualan aset
-                        arus_kas_data['penjualan_aset'] += debit
-                
-                # 🎯 AKTIVITAS PENDANAAN  
-                elif any(keyword in deskripsi for keyword in ['modal', 'tambahan modal']):
-                    if debit > 0:  # Tambahan modal
-                        arus_kas_data['tambahan_modal'] += debit
-                
-                elif 'prive' in deskripsi:
-                    if kredit > 0:  # Pengambilan prive
-                        arus_kas_data['prive'] += kredit
-                
-                elif any(keyword in deskripsi for keyword in ['pinjaman', 'hutang', 'utang']):
-                    if debit > 0:  # Penerimaan pinjaman
-                        arus_kas_data['pinjaman'] += debit
-                    elif kredit > 0:  # Pelunasan pinjaman
-                        arus_kas_data['pelunasan_pinjaman'] += kredit
+            # TAMBAHAN MODAL (modal bertambah, kas bertambah)
+            if any(keyword in nama_akun for keyword in ['modal', 'ekuitas']):
+                if kredit > 0:
+                    aktivitas['tambahan_modal'] += kredit
+            
+            # PRIVE (modal berkurang, kas berkurang)
+            if 'prive' in nama_akun and debit > 0:
+                aktivitas['prive'] += debit
+            
+            # PINJAMAN (utang bertambah, kas bertambah)
+            if any(keyword in nama_akun for keyword in ['pinjaman', 'hutang', 'utang bank']):
+                if kredit > 0:
+                    aktivitas['pinjaman'] += kredit
+            
+            # PELUNASAN PINJAMAN (utang berkurang, kas berkurang)
+            if any(keyword in nama_akun for keyword in ['pinjaman', 'hutang', 'utang bank']):
+                if debit > 0:
+                    aktivitas['pelunasan_pinjaman'] += debit
         
-        # Hitung totals
-        total_penerimaan_operasi = sum(arus_kas_data['penerimaan_kas'].values())
-        total_pengeluaran_operasi = sum(arus_kas_data['pengeluaran_operasi'].values())
-        arus_kas_operasi = total_penerimaan_operasi - total_pengeluaran_operasi
+        return aktivitas
         
-        arus_kas_investasi = arus_kas_data['penjualan_aset'] - arus_kas_data['pembelian_aset'] + arus_kas_data['investasi_lainnya']
+    except Exception as e:
+        logger.error(f"❌ Error hitung_aktivitas_pendanaan_otomatis: {str(e)}")
+        return {'tambahan_modal': 0, 'prive': 0, 'pinjaman': 0, 'pelunasan_pinjaman': 0}
+
+def hitung_arus_kas_otomatis():
+    """Hitung arus kas secara otomatis dari semua transaksi"""
+    try:
+        # Ambil data jurnal
+        jurnal_result = supabase.table("jurnal_umum").select("*").execute()
+        jurnal_data = jurnal_result.data or []
         
-        arus_kas_pendanaan = arus_kas_data['tambahan_modal'] + arus_kas_data['pinjaman'] - arus_kas_data['prive'] - arus_kas_data['pelunasan_pinjaman']
+        logger.info(f"🚀 Memulai perhitungan arus kas dari {len(jurnal_data)} transaksi")
         
+        if not jurnal_data:
+            logger.warning("⚠️ Tidak ada data transaksi")
+            return None
+        
+        # 1. HITUNG LABA BERSIH
+        laba_bersih = hitung_laba_bersih_otomatis()
+        logger.info(f"📊 Laba bersih: {laba_bersih}")
+        
+        # 2. HITUNG PENYESUAIAN ARUS KAS OPERASI
+        penyesuaian = hitung_penyesuaian_arus_kas_otomatis()
+        
+        # 3. HITUNG AKTIVITAS INVESTASI
+        investasi = hitung_aktivitas_investasi_otomatis()
+        
+        # 4. HITUNG AKTIVITAS PENDANAAN
+        pendanaan = hitung_aktivitas_pendanaan_otomatis()
+        
+        # 5. HITUNG ARUS KAS OPERASI
+        total_penambah = (penyesuaian['beban_penyusutan'] + 
+                         penyesuaian['perubahan_persediaan'] + 
+                         penyesuaian['perubahan_perlengkapan'] + 
+                         penyesuaian['perubahan_piutang'])
+        
+        total_pengurang = penyesuaian['perubahan_utang_dagang']
+        
+        arus_kas_operasi = laba_bersih + total_penambah - total_pengurang
+        
+        # 6. HITUNG ARUS KAS INVESTASI
+        arus_kas_investasi = investasi['penjualan_aset'] - investasi['pembelian_aset']
+        
+        # 7. HITUNG ARUS KAS PENDANAAN
+        arus_kas_pendanaan = (pendanaan['tambahan_modal'] + 
+                             pendanaan['pinjaman'] - 
+                             pendanaan['prive'] - 
+                             pendanaan['pelunasan_pinjaman'])
+        
+        # 8. HITUNG KENAIKAN BERSIH KAS
         kenaikan_bersih_kas = arus_kas_operasi + arus_kas_investasi + arus_kas_pendanaan
+        saldo_kas_akhir = 150885000 + kenaikan_bersih_kas  # Saldo awal Rp 150.885.000
         
-        # Saldo kas awal (asumsi)
-        saldo_kas_awal = 15000000  # Rp 15.000.000
-        saldo_kas_akhir = saldo_kas_awal + kenaikan_bersih_kas
-        
-        logger.info(f"📊 Ringkasan Arus Kas:")
-        logger.info(f"   Operasi: {arus_kas_operasi}")
-        logger.info(f"   Investasi: {arus_kas_investasi}") 
-        logger.info(f"   Pendanaan: {arus_kas_pendanaan}")
-        logger.info(f"   Kenaikan Bersih: {kenaikan_bersih_kas}")
-        
-        return {
-            **arus_kas_data,
-            'total_penerimaan_operasi': total_penerimaan_operasi,
-            'total_pengeluaran_operasi': total_pengeluaran_operasi,
+        # Siapkan hasil
+        result = {
+            'laba_bersih': laba_bersih,
+            'beban_penyusutan': penyesuaian['beban_penyusutan'],
+            'perubahan_persediaan': penyesuaian['perubahan_persediaan'],
+            'perubahan_perlengkapan': penyesuaian['perubahan_perlengkapan'],
+            'perubahan_piutang': penyesuaian['perubahan_piutang'],
+            'perubahan_utang_dagang': penyesuaian['perubahan_utang_dagang'],
+            'pembelian_aset': investasi['pembelian_aset'],
+            'penjualan_aset': investasi['penjualan_aset'],
+            'tambahan_modal': pendanaan['tambahan_modal'],
+            'prive': pendanaan['prive'],
+            'pinjaman': pendanaan['pinjaman'],
+            'pelunasan_pinjaman': pendanaan['pelunasan_pinjaman'],
+            'saldo_kas_awal': 150885000,
+            'periode': 'SEPTEMBER 2025',
+            'jurnal_diproses': len(jurnal_data),
+            'total_penambah': total_penambah,
+            'total_pengurang': total_pengurang,
             'arus_kas_operasi': arus_kas_operasi,
             'arus_kas_investasi': arus_kas_investasi,
             'arus_kas_pendanaan': arus_kas_pendanaan,
             'kenaikan_bersih_kas': kenaikan_bersih_kas,
-            'saldo_kas_awal': saldo_kas_awal,
-            'saldo_kas_akhir': saldo_kas_akhir,
-            'jurnal_diproses': len(jurnal_data)
+            'saldo_kas_akhir': saldo_kas_akhir
         }
+        
+        logger.info(f"🎉 HASIL ARUS KAS:")
+        logger.info(f"   Laba Bersih: {laba_bersih}")
+        logger.info(f"   Beban Penyusutan: {penyesuaian['beban_penyusutan']}")
+        logger.info(f"   Perubahan Persediaan: {penyesuaian['perubahan_persediaan']}")
+        logger.info(f"   Arus Kas Operasi: {arus_kas_operasi}")
+        logger.info(f"   Kenaikan Bersih Kas: {kenaikan_bersih_kas}")
+        
+        return result
         
     except Exception as e:
         logger.error(f"❌ Error hitung_arus_kas_otomatis: {str(e)}")
         import traceback
         logger.error(f"🔍 Traceback: {traceback.format_exc()}")
-        return {}
+        return None
 
-def generate_aktivitas_operasi(arus_kas_data, rp_func):
-    """Generate HTML section untuk aktivitas operasi"""
+def generate_tabel_arus_kas_otomatis(arus_kas_data, rp_func):
+    """Generate tabel arus kas otomatis"""
     
-    penerimaan_items = ""
-    for item, nilai in arus_kas_data['penerimaan_kas'].items():
-        if nilai > 0:
-            penerimaan_items += f"""
-            <tr>
-                <td style="padding-left: 20px;">{item.replace('_', ' ').title()}</td>
-                <td class="number positive">+ {rp_func(nilai)}</td>
-            </tr>
-            """
+    def format_amount(amount, show_plus=False):
+        if amount == 0:
+            return "Rp0"
+        sign = ""
+        if amount < 0:
+            sign = "-"
+            amount = abs(amount)
+        elif show_plus and amount > 0:
+            sign = "+"
+        return f"{sign}{rp_func(amount)}"
     
-    pengeluaran_items = ""
-    for item, nilai in arus_kas_data['pengeluaran_operasi'].items():
-        if nilai > 0:
-            pengeluaran_items += f"""
-            <tr>
-                <td style="padding-left: 20px;">{item.replace('_', ' ').title()}</td>
-                <td class="number negative">- {rp_func(nilai)}</td>
-            </tr>
-            """
+    # Generate items untuk penambah
+    penambah_items = []
+    if arus_kas_data['beban_penyusutan'] > 0:
+        penambah_items.append(f'<tr><td class="description">Beban Penyusutan</td><td class="amount">{format_amount(arus_kas_data["beban_penyusutan"], True)}</td></tr>')
+    if arus_kas_data['perubahan_persediaan'] > 0:
+        penambah_items.append(f'<tr><td class="description">Penurunan Persediaan Barang</td><td class="amount">{format_amount(arus_kas_data["perubahan_persediaan"], True)}</td></tr>')
+    if arus_kas_data['perubahan_perlengkapan'] > 0:
+        penambah_items.append(f'<tr><td class="description">Penurunan Perlengkapan</td><td class="amount">{format_amount(arus_kas_data["perubahan_perlengkapan"], True)}</td></tr>')
+    if arus_kas_data['perubahan_piutang'] > 0:
+        penambah_items.append(f'<tr><td class="description">Penurunan Piutang</td><td class="amount">{format_amount(arus_kas_data["perubahan_piutang"], True)}</td></tr>')
     
-    return f"""
-    <div class="section">
-        <h2 class="section-title">🏢 Aktivitas Operasi</h2>
-        <p>Arus kas dari aktivitas operasi utama perusahaan</p>
-        
-        <table class="calculation-table">
-            <thead>
-                <tr>
-                    <th>Penerimaan Kas dari Operasi</th>
-                    <th>Jumlah</th>
-                </tr>
-            </thead>
-            <tbody>
-                {penerimaan_items if penerimaan_items.strip() else '''
-                <tr>
-                    <td colspan="2" style="text-align: center; color: #999;">
-                        Belum ada penerimaan kas dari operasi
-                    </td>
-                </tr>
-                '''}
-                <tr class="subtotal-row">
-                    <td><strong>Total Penerimaan Operasi</strong></td>
-                    <td class="number positive"><strong>+ {rp_func(arus_kas_data['total_penerimaan_operasi'])}</strong></td>
-                </tr>
-            </tbody>
-        </table>
-        
-        <table class="calculation-table" style="margin-top: 20px;">
-            <thead>
-                <tr>
-                    <th>Pengeluaran Kas untuk Operasi</th>
-                    <th>Jumlah</th>
-                </tr>
-            </thead>
-            <tbody>
-                {pengeluaran_items if pengeluaran_items.strip() else '''
-                <tr>
-                    <td colspan="2" style="text-align: center; color: #999;">
-                        Belum ada pengeluaran kas untuk operasi
-                    </td>
-                </tr>
-                '''}
-                <tr class="subtotal-row">
-                    <td><strong>Total Pengeluaran Operasi</strong></td>
-                    <td class="number negative"><strong>- {rp_func(arus_kas_data['total_pengeluaran_operasi'])}</strong></td>
-                </tr>
-            </tbody>
-        </table>
-        
-        <div class="total-row" style="padding: 15px; background: #e6f2ff; border-radius: 8px; margin-top: 15px;">
-            <table style="width: 100%;">
-                <tr>
-                    <td><strong>ARUS KAS BERSIH DARI AKTIVITAS OPERASI</strong></td>
-                    <td class="number {'positive' if arus_kas_data['arus_kas_operasi'] >= 0 else 'negative'}">
-                        <strong>{rp_func(arus_kas_data['arus_kas_operasi'])}</strong>
-                    </td>
-                </tr>
-            </table>
-        </div>
-    </div>
-    """
-
-def generate_aktivitas_investasi(arus_kas_data, rp_func):
-    """Generate HTML section untuk aktivitas investasi"""
+    penambah_html = '\n'.join(penambah_items) if penambah_items else '<tr><td class="description" colspan="2" style="text-align: center; color: #999;">Tidak ada penambah</td></tr>'
     
-    investasi_items = ""
+    # Generate items untuk pengurang
+    pengurang_items = []
+    if arus_kas_data['perubahan_utang_dagang'] > 0:
+        pengurang_items.append(f'<tr><td class="description">Penurunan Utang Dagang</td><td class="amount negative">{format_amount(-arus_kas_data["perubahan_utang_dagang"])}</td></tr>')
+    
+    pengurang_html = '\n'.join(pengurang_items) if pengurang_items else '<tr><td class="description" colspan="2" style="text-align: center; color: #999;">Tidak ada pengurang</td></tr>'
+    
+    # Generate items untuk investasi
+    investasi_items = []
     if arus_kas_data['penjualan_aset'] > 0:
-        investasi_items += f"""
-        <tr>
-            <td style="padding-left: 20px;">Penjualan Aset Tetap</td>
-            <td class="number positive">+ {rp_func(arus_kas_data['penjualan_aset'])}</td>
-        </tr>
-        """
-    
+        investasi_items.append(f'<tr><td class="description">Penjualan Aset Tetap</td><td class="amount">{format_amount(arus_kas_data["penjualan_aset"], True)}</td></tr>')
     if arus_kas_data['pembelian_aset'] > 0:
-        investasi_items += f"""
-        <tr>
-            <td style="padding-left: 20px;">Pembelian Aset Tetap</td>
-            <td class="number negative">- {rp_func(arus_kas_data['pembelian_aset'])}</td>
-        </tr>
-        """
+        investasi_items.append(f'<tr><td class="description">Pembelian Aset Tetap</td><td class="amount negative">{format_amount(-arus_kas_data["pembelian_aset"])}</td></tr>')
     
-    return f"""
-    <div class="section">
-        <h2 class="section-title">🏗️ Aktivitas Investasi</h2>
-        <p>Arus kas dari pembelian dan penjualan aset tetap</p>
-        
-        <table class="calculation-table">
-            <thead>
-                <tr>
-                    <th>Transaksi Investasi</th>
-                    <th>Jumlah</th>
-                </tr>
-            </thead>
-            <tbody>
-                {investasi_items if investasi_items.strip() else '''
-                <tr>
-                    <td colspan="2" style="text-align: center; color: #999;">
-                        Belum ada transaksi investasi
-                    </td>
-                </tr>
-                '''}
-                <tr class="total-row">
-                    <td><strong>ARUS KAS BERSIH DARI AKTIVITAS INVESTASI</strong></td>
-                    <td class="number {'positive' if arus_kas_data['arus_kas_investasi'] >= 0 else 'negative'}">
-                        <strong>{rp_func(arus_kas_data['arus_kas_investasi'])}</strong>
-                    </td>
-                </tr>
-            </tbody>
-        </table>
-    </div>
-    """
-
-def generate_aktivitas_pendanaan(arus_kas_data, rp_func):
-    """Generate HTML section untuk aktivitas pendanaan"""
+    investasi_html = '\n'.join(investasi_items) if investasi_items else '<tr><td class="description" colspan="2" style="text-align: center; color: #999;">Tidak ada aktivitas investasi</td></tr>'
     
-    pendanaan_items = ""
+    # Generate items untuk pendanaan
+    pendanaan_items = []
     if arus_kas_data['tambahan_modal'] > 0:
-        pendanaan_items += f"""
-        <tr>
-            <td style="padding-left: 20px;">Tambahan Modal</td>
-            <td class="number positive">+ {rp_func(arus_kas_data['tambahan_modal'])}</td>
-        </tr>
-        """
-    
+        pendanaan_items.append(f'<tr><td class="description">Tambahan Modal</td><td class="amount">{format_amount(arus_kas_data["tambahan_modal"], True)}</td></tr>')
     if arus_kas_data['pinjaman'] > 0:
-        pendanaan_items += f"""
-        <tr>
-            <td style="padding-left: 20px;">Penerimaan Pinjaman</td>
-            <td class="number positive">+ {rp_func(arus_kas_data['pinjaman'])}</td>
-        </tr>
-        """
-    
+        pendanaan_items.append(f'<tr><td class="description">Penerimaan Pinjaman</td><td class="amount">{format_amount(arus_kas_data["pinjaman"], True)}</td></tr>')
     if arus_kas_data['prive'] > 0:
-        pendanaan_items += f"""
-        <tr>
-            <td style="padding-left: 20px;">Pengambilan Prive</td>
-            <td class="number negative">- {rp_func(arus_kas_data['prive'])}</td>
-        </tr>
-        """
-    
+        pendanaan_items.append(f'<tr><td class="description">Pengambilan Prive</td><td class="amount negative">{format_amount(-arus_kas_data["prive"])}</td></tr>')
     if arus_kas_data['pelunasan_pinjaman'] > 0:
-        pendanaan_items += f"""
-        <tr>
-            <td style="padding-left: 20px;">Pelunasan Pinjaman</td>
-            <td class="number negative">- {rp_func(arus_kas_data['pelunasan_pinjaman'])}</td>
+        pendanaan_items.append(f'<tr><td class="description">Pelunasan Pinjaman</td><td class="amount negative">{format_amount(-arus_kas_data["pelunasan_pinjaman"])}</td></tr>')
+    
+    pendanaan_html = '\n'.join(pendanaan_items) if pendanaan_items else '<tr><td class="description" colspan="2" style="text-align: center; color: #999;">Tidak ada aktivitas pendanaan</td></tr>'
+    
+    return f"""
+    <table class="cash-flow-table">
+        <!-- Aktivitas Operasi -->
+        <tr class="section-header">
+            <td colspan="2">Arus Kas Dari Aktivitas Operasional</td>
         </tr>
-        """
-    
-    return f"""
-    <div class="section">
-        <h2 class="section-title">💰 Aktivitas Pendanaan</h2>
-        <p>Arus kas dari transaksi dengan pemilik dan kreditur</p>
+        <tr>
+            <td>Laba Bersih (dari laporan laba rugi)</td>
+            <td class="amount">{format_amount(arus_kas_data['laba_bersih'])}</td>
+        </tr>
         
-        <table class="calculation-table">
-            <thead>
-                <tr>
-                    <th>Transaksi Pendanaan</th>
-                    <th>Jumlah</th>
-                </tr>
-            </thead>
-            <tbody>
-                {pendanaan_items if pendanaan_items.strip() else '''
-                <tr>
-                    <td colspan="2" style="text-align: center; color: #999;">
-                        Belum ada transaksi pendanaan
-                    </td>
-                </tr>
-                '''}
-                <tr class="total-row">
-                    <td><strong>ARUS KAS BERSIH DARI AKTIVITAS PENDANAAN</strong></td>
-                    <td class="number {'positive' if arus_kas_data['arus_kas_pendanaan'] >= 0 else 'negative'}">
-                        <strong>{rp_func(arus_kas_data['arus_kas_pendanaan'])}</strong>
-                    </td>
-                </tr>
-            </tbody>
-        </table>
-    </div>
-    """
-
-def generate_ringkasan_arus_kas(arus_kas_data, rp_func):
-    """Generate HTML section untuk ringkasan arus kas"""
-    
-    is_positive = arus_kas_data['kenaikan_bersih_kas'] >= 0
-    
-    return f"""
-    <div class="section {'cash-flow-positive' if is_positive else 'cash-flow-negative'}">
-        <h2 class="section-title" style="color: {'#00cc66' if is_positive else '#ff6666'};">
-            📊 Ringkasan Arus Kas
-        </h2>
+        <tr class="sub-header">
+            <td colspan="2">Ditambah :</td>
+        </tr>
+        {penambah_html}
         
-        <table class="calculation-table">
-            <tbody>
-                <tr>
-                    <td><strong>Arus Kas dari Aktivitas Operasi</strong></td>
-                    <td class="number {'positive' if arus_kas_data['arus_kas_operasi'] >= 0 else 'negative'}">
-                        {rp_func(arus_kas_data['arus_kas_operasi'])}
-                    </td>
-                </tr>
-                <tr>
-                    <td><strong>Arus Kas dari Aktivitas Investasi</strong></td>
-                    <td class="number {'positive' if arus_kas_data['arus_kas_investasi'] >= 0 else 'negative'}">
-                        {rp_func(arus_kas_data['arus_kas_investasi'])}
-                    </td>
-                </tr>
-                <tr>
-                    <td><strong>Arus Kas dari Aktivitas Pendanaan</strong></td>
-                    <td class="number {'positive' if arus_kas_data['arus_kas_pendanaan'] >= 0 else 'negative'}">
-                        {rp_func(arus_kas_data['arus_kas_pendanaan'])}
-                    </td>
-                </tr>
-                <tr class="total-row">
-                    <td><strong>KENAIKAN (PENURUNAN) BERSIH KAS</strong></td>
-                    <td class="number {'positive' if is_positive else 'negative'}">
-                        <strong>{rp_func(arus_kas_data['kenaikan_bersih_kas'])}</strong>
-                    </td>
-                </tr>
-                <tr>
-                    <td><strong>Saldo Kas Awal Periode</strong></td>
-                    <td class="number">{rp_func(arus_kas_data['saldo_kas_awal'])}</td>
-                </tr>
-                <tr class="total-row">
-                    <td><strong>SALDO KAS AKHIR PERIODE</strong></td>
-                    <td class="number positive">
-                        <strong>{rp_func(arus_kas_data['saldo_kas_akhir'])}</strong>
-                    </td>
-                </tr>
-            </tbody>
-        </table>
+        <tr class="sub-total">
+            <td>Total Penambah</td>
+            <td class="amount">{format_amount(arus_kas_data['total_penambah'], True)}</td>
+        </tr>
         
-        <div style="text-align: center; margin-top: 15px; padding: 15px; background: {'#d4ffd4' if is_positive else '#ffd4d4'}; border-radius: 8px;">
-            <h3 style="color: {'#006600' if is_positive else '#cc0000'};">
-                {'💰 KAS BERTAMBAH' if is_positive else '📉 KAS BERKURANG'}
-            </h3>
-            <p style="color: {'#006600' if is_positive else '#cc0000'}; margin: 5px 0;">
-                {f"Kas meningkat sebesar {rp_func(arus_kas_data['kenaikan_bersih_kas'])} selama periode ini" if is_positive else f"Kas berkurang sebesar {rp_func(abs(arus_kas_data['kenaikan_bersih_kas']))} selama periode ini"}
-            </p>
+        <tr class="sub-header">
+            <td colspan="2">Dikurangi</td>
+        </tr>
+        {pengurang_html}
+        
+        <tr class="sub-total">
+            <td>Total Pengurang</td>
+            <td class="amount negative">{format_amount(-arus_kas_data['total_pengurang'])}</td>
+        </tr>
+        
+        <tr class="grand-total">
+            <td><strong>Arus Kas Bersih Dari Aktivitas Operasional</strong></td>
+            <td class="amount">{format_amount(arus_kas_data['arus_kas_operasi'])}</td>
+        </tr>
+        
+        <!-- Aktivitas Investasi -->
+        <tr class="section-header">
+            <td colspan="2">Arus Kas Dari Aktivitas Investasi</td>
+        </tr>
+        {investasi_html}
+        
+        <tr class="grand-total">
+            <td><strong>Arus Kas Bersih Dari Aktivitas Investasi</strong></td>
+            <td class="amount">{format_amount(arus_kas_data['arus_kas_investasi'])}</td>
+        </tr>
+        
+        <!-- Aktivitas Pendanaan -->
+        <tr class="section-header">
+            <td colspan="2">Arus Kas Dari Aktivitas Pembiayaan</td>
+        </tr>
+        {pendanaan_html}
+        
+        <tr class="grand-total">
+            <td><strong>Arus Kas Bersih Dari Aktivitas Pembiayaan</strong></td>
+            <td class="amount">{format_amount(arus_kas_data['arus_kas_pendanaan'])}</td>
+        </tr>
+        
+        <!-- Ringkasan Akhir -->
+        <tr class="final-total">
+            <td><strong>Kenaikan Bersih Kas</strong></td>
+            <td class="amount">{format_amount(arus_kas_data['kenaikan_bersih_kas'])}</td>
+        </tr>
+        
+        <tr>
+            <td>Saldo Kas Awal Periode</td>
+            <td class="amount">{format_amount(arus_kas_data['saldo_kas_awal'])}</td>
+        </tr>
+        
+        <tr class="final-total">
+            <td><strong>Saldo Kas Akhir Periode</strong></td>
+            <td class="amount">{format_amount(arus_kas_data['saldo_kas_akhir'])}</td>
+        </tr>
+    </table>
+    
+    <!-- Statistics -->
+    <div class="stats-grid">
+        <div class="stat-item">
+            <div class="stat-value">{arus_kas_data['jurnal_diproses']}</div>
+            <div class="stat-label">Transaksi Diproses</div>
         </div>
-    </div>
-    """
-
-def generate_grafik_arus_kas(arus_kas_data, rp_func):
-    """Generate HTML section untuk grafik arus kas"""
-    
-    # Hitung persentase untuk grafik
-    total_absolute = abs(arus_kas_data['arus_kas_operasi']) + abs(arus_kas_data['arus_kas_investasi']) + abs(arus_kas_data['arus_kas_pendanaan'])
-    
-    if total_absolute > 0:
-        pct_operasi = (abs(arus_kas_data['arus_kas_operasi']) / total_absolute) * 100
-        pct_investasi = (abs(arus_kas_data['arus_kas_investasi']) / total_absolute) * 100
-        pct_pendanaan = (abs(arus_kas_data['arus_kas_pendanaan']) / total_absolute) * 100
-    else:
-        pct_operasi = pct_investasi = pct_pendanaan = 0
-    
-    return f"""
-    <div class="section">
-        <h2 class="section-title">📈 Grafik Komposisi Arus Kas</h2>
-        
-        <div class="chart-container">
-            <h3 style="color: #66b3ff; margin-bottom: 20px;">Distribusi Arus Kas per Aktivitas</h3>
-            
-            <div class="chart-bar">
-                <div class="chart-label">Aktivitas Operasi</div>
-                <div class="chart-bar-inner">
-                    <div class="chart-bar-fill" style="width: {pct_operasi}%; background: {'#00cc66' if arus_kas_data['arus_kas_operasi'] >= 0 else '#ff6666'};"></div>
-                </div>
-                <div class="chart-value {'positive' if arus_kas_data['arus_kas_operasi'] >= 0 else 'negative'}">
-                    {rp_func(arus_kas_data['arus_kas_operasi'])}
-                </div>
-            </div>
-            
-            <div class="chart-bar">
-                <div class="chart-label">Aktivitas Investasi</div>
-                <div class="chart-bar-inner">
-                    <div class="chart-bar-fill" style="width: {pct_investasi}%; background: {'#00cc66' if arus_kas_data['arus_kas_investasi'] >= 0 else '#ff6666'};"></div>
-                </div>
-                <div class="chart-value {'positive' if arus_kas_data['arus_kas_investasi'] >= 0 else 'negative'}">
-                    {rp_func(arus_kas_data['arus_kas_investasi'])}
-                </div>
-            </div>
-            
-            <div class="chart-bar">
-                <div class="chart-label">Aktivitas Pendanaan</div>
-                <div class="chart-bar-inner">
-                    <div class="chart-bar-fill" style="width: {pct_pendanaan}%; background: {'#00cc66' if arus_kas_data['arus_kas_pendanaan'] >= 0 else '#ff6666'};"></div>
-                </div>
-                <div class="chart-value {'positive' if arus_kas_data['arus_kas_pendanaan'] >= 0 else 'negative'}">
-                    {rp_func(arus_kas_data['arus_kas_pendanaan'])}
-                </div>
-            </div>
+        <div class="stat-item">
+            <div class="stat-value">{rp_func(arus_kas_data['laba_bersih'])}</div>
+            <div class="stat-label">Laba Bersih</div>
         </div>
-        
-        <div style="margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 8px;">
-            <h4 style="color: #666; margin-bottom: 10px;">📋 Analisis Arus Kas:</h4>
-            <ul style="color: #666;">
-                <li><strong>Operasi:</strong> { 'Positif' if arus_kas_data['arus_kas_operasi'] >= 0 else 'Negatif' } - { 'Perusahaan menghasilkan kas dari operasi utama' if arus_kas_data['arus_kas_operasi'] >= 0 else 'Perusahaan menggunakan kas untuk operasi' }</li>
-                <li><strong>Investasi:</strong> { 'Positif' if arus_kas_data['arus_kas_investasi'] >= 0 else 'Negatif' } - { 'Perusahaan menjual aset' if arus_kas_data['arus_kas_investasi'] >= 0 else 'Perusahaan berinvestasi dalam aset baru' }</li>
-                <li><strong>Pendanaan:</strong> { 'Positif' if arus_kas_data['arus_kas_pendanaan'] >= 0 else 'Negatif' } - { 'Perusahaan mendapatkan pendanaan baru' if arus_kas_data['arus_kas_pendanaan'] >= 0 else 'Perusahaan melunasi kewajiban' }</li>
-            </ul>
+        <div class="stat-item">
+            <div class="stat-value">{rp_func(arus_kas_data['arus_kas_operasi'])}</div>
+            <div class="stat-label">Kas dari Operasi</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value {'positive' if arus_kas_data['kenaikan_bersih_kas'] >= 0 else 'negative'}">{rp_func(arus_kas_data['kenaikan_bersih_kas'])}</div>
+            <div class="stat-label">Kenaikan Bersih Kas</div>
         </div>
     </div>
     """
